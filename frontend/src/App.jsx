@@ -16,6 +16,13 @@ import {
 } from "recharts";
 
 const API = "http://localhost:5000/api";
+const getToken = () => localStorage.getItem("networkAttackToken");
+
+const authHeaders = (json = false) => ({
+  ...(json ? { "Content-Type": "application/json" } : {}),
+  Authorization: `Bearer ${getToken()}`,
+});
+
 
 const COLORS = [
   "#6366f1",
@@ -26,41 +33,189 @@ const COLORS = [
   "#8b5cf6",
 ];
 
+// =====================================================
+// SIMPLE PAGE HEADER
+// =====================================================
+
+const SimplePage = ({
+  title,
+  description,
+  children,
+  onBack,
+}) => {
+  return (
+    <>
+      <div className="welcome-row">
+        <div>
+          <h2>{title}</h2>
+          <p>{description}</p>
+        </div>
+
+        <button
+          className="secondary-btn"
+          onClick={onBack}
+        >
+          ← Back to Dashboard
+        </button>
+      </div>
+
+      {children}
+    </>
+  );
+};
+
+// =====================================================
+// APP
+// =====================================================
+
 function App() {
   const [page, setPage] = useState("dashboard");
-  const [loggedIn, setLoggedIn] = useState(false);
+
+  const [loggedIn, setLoggedIn] = useState(
+    Boolean(localStorage.getItem("networkAttackToken"))
+  );
+
   const [authMode, setAuthMode] = useState("login");
 
   const [email, setEmail] = useState("");
+
   const [password, setPassword] = useState("");
+
   const [name, setName] = useState("");
 
   const [dashboard, setDashboard] = useState(null);
+
   const [monitoring, setMonitoring] = useState(false);
+
   const [loading, setLoading] = useState(false);
+
   const [message, setMessage] = useState("");
 
+  const [alerts, setAlerts] = useState([]);
+
   const [scanResults, setScanResults] = useState([]);
+
   const [traffic, setTraffic] = useState(null);
-  const [intelResult, setIntelResult] = useState(null);
+
+  const [trafficRecords, setTrafficRecords] = useState([]);
+
   const [target, setTarget] = useState("");
+
+  const [intelResult, setIntelResult] = useState(null);
 
   const [report, setReport] = useState(null);
 
-  /* =========================================================
-     SETTINGS STATES
-  ========================================================= */
+  const [monitorStartedAt, setMonitorStartedAt] =
+    useState(null);
 
-  const [autoRefresh, setAutoRefresh] = useState(true);
-  const [notifications, setNotifications] = useState(true);
-  const [highSecurity, setHighSecurity] = useState(true);
-  const [twoFactor, setTwoFactor] = useState(false);
-  const [scanInterval, setScanInterval] = useState("30");
-  const [settingsSaved, setSettingsSaved] = useState(false);
+  // ===================================================
+  // LOAD DASHBOARD
+  // ===================================================
 
-  /* =========================================================
-     LOAD DASHBOARD
-  ========================================================= */
+  const loadDashboard = async () => {
+    try {
+      const token = getToken();
+
+      if (!token) {
+        setLoggedIn(false);
+        setPage("login");
+        return;
+      }
+
+      const [dashboardRes, alertsRes, trafficRes] = await Promise.all([
+        fetch(`${API}/dashboard`, {
+          headers: authHeaders(),
+        }),
+        fetch(`${API}/alerts`, {
+          headers: authHeaders(),
+        }),
+        fetch(`${API}/traffic`, {
+          headers: authHeaders(),
+        }),
+      ]);
+
+      if (
+        dashboardRes.status === 401 ||
+        dashboardRes.status === 403 ||
+        alertsRes.status === 401 ||
+        alertsRes.status === 403 ||
+        trafficRes.status === 401 ||
+        trafficRes.status === 403
+      ) {
+        localStorage.removeItem("networkAttackToken");
+        setLoggedIn(false);
+        setPage("login");
+        return;
+      }
+
+      const dashboardData = await dashboardRes.json();
+      const alertData = await alertsRes.json();
+      const trafficDataResponse = await trafficRes.json();
+
+      const records =
+        trafficDataResponse.success &&
+        Array.isArray(trafficDataResponse.traffic)
+          ? trafficDataResponse.traffic
+          : [];
+
+      setTrafficRecords(records);
+
+      const totalPackets = records.reduce(
+        (sum, item) => sum + Number(item.packetCount || 0),
+        0
+      );
+
+      const totalConnections = records.length;
+
+      const suspiciousTraffic = records.filter(
+        (item) =>
+          String(item.label || "BENIGN").toUpperCase() !== "BENIGN"
+      ).length;
+
+      const protocolCounts = records.reduce((acc, item) => {
+        const protocol = String(item.protocol || "OTHER").toUpperCase();
+        acc[protocol] = (acc[protocol] || 0) + 1;
+        return acc;
+      }, {});
+
+      if (dashboardData.success) {
+        const d = dashboardData.data || {};
+
+        setDashboard({
+          stats: {
+            packets: totalPackets || d.packets || d.totalPackets || 0,
+            threats: d.threatsDetected ?? d.threats ?? suspiciousTraffic,
+            blocked: d.blockedThreats ?? d.blocked ?? 0,
+            activeAlerts: d.totalAlerts ?? d.activeAlerts ?? 0,
+            connections: totalConnections || d.connections || 0,
+          },
+          risk: {
+            score: d.riskScore ?? d.risk?.score ?? 48,
+            level: d.riskLevel ?? d.risk?.level ?? "Medium",
+          },
+          traffic: {
+            ...(d.traffic || {}),
+            incoming: totalPackets,
+            outgoing: 0,
+            suspicious: suspiciousTraffic,
+          },
+          protocols: protocolCounts,
+          networkStatus: d.networkStatus || "Secure",
+        });
+      }
+
+      if (alertData.success) {
+        setAlerts(alertData.alerts || alertData.data || []);
+      }
+    } catch (error) {
+      console.error("Dashboard error:", error);
+      setMessage("Unable to connect to backend");
+    }
+  };
+
+  // ===================================================
+  // INITIAL DASHBOARD LOAD
+  // ===================================================
 
   useEffect(() => {
     if (loggedIn) {
@@ -68,177 +223,347 @@ function App() {
     }
   }, [loggedIn]);
 
-  const loadDashboard = async () => {
-    try {
-      const res = await fetch(`${API}/dashboard`);
-      const data = await res.json();
+  // ===================================================
+  // AUTO REFRESH WHILE MONITORING
+  // ===================================================
 
-      if (data.success) {
-        setDashboard(data);
-        setMonitoring(data.monitoring);
-      }
-    } catch {
-      setMessage("Unable to connect to backend");
+  useEffect(() => {
+    if (!loggedIn || !monitoring) {
+      return;
     }
-  };
 
-  /* =========================================================
-     LOGIN
-  ========================================================= */
+    const interval =
+      setInterval(() => {
+        loadDashboard();
+      }, 5000);
+
+    return () => {
+      clearInterval(interval);
+    };
+  }, [loggedIn, monitoring]);
+
+  // ===================================================
+  // LOGIN
+  // ===================================================
 
   const login = async (e) => {
     e.preventDefault();
 
+    if (!email || !password) {
+      setMessage(
+        "Please enter email and password"
+      );
+      return;
+    }
+
     try {
       setLoading(true);
 
-      const res = await fetch(`${API}/auth/login`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          email,
-          password,
-        }),
-      });
+      setMessage("");
 
-      const data = await res.json();
+      const res = await fetch(
+        `${API}/auth/login`,
+        {
+          method: "POST",
 
-      if (!data.success) {
-        setMessage(data.message);
+          headers: {
+            "Content-Type":
+              "application/json",
+          },
+
+          body: JSON.stringify({
+            email,
+            password,
+          }),
+        }
+      );
+
+      const data =
+        await res.json();
+
+      if (!res.ok || !data.success) {
+        setMessage(
+          data.message ||
+            "Invalid login details"
+        );
+
         return;
       }
 
+      if (data.token) {
+        localStorage.setItem(
+          "networkAttackToken",
+          data.token
+        );
+      }
+
       setLoggedIn(true);
+
       setPage("dashboard");
-      setMessage("Login successful");
-    } catch {
-      setMessage("Backend connection failed");
+
+      setMessage(
+        "Login successful"
+      );
+    } catch (error) {
+      console.error(error);
+
+      setMessage(
+        "Backend connection failed"
+      );
     } finally {
       setLoading(false);
     }
   };
 
-  /* =========================================================
-     REGISTER
-  ========================================================= */
+  // ===================================================
+  // REGISTER
+  // ===================================================
 
   const register = async (e) => {
     e.preventDefault();
 
+    if (!name || !email || !password) {
+      setMessage(
+        "Please fill all fields"
+      );
+
+      return;
+    }
+
     try {
       setLoading(true);
 
-      const res = await fetch(`${API}/auth/register`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          name,
-          email,
-          password,
-        }),
-      });
+      setMessage("");
 
-      const data = await res.json();
+      const res = await fetch(
+        `${API}/auth/register`,
+        {
+          method: "POST",
 
-      if (!data.success) {
-        setMessage(data.message);
+          headers: {
+            "Content-Type":
+              "application/json",
+          },
+
+          body: JSON.stringify({
+            name,
+            email,
+            password,
+          }),
+        }
+      );
+
+      const data =
+        await res.json();
+
+      if (!res.ok || !data.success) {
+        setMessage(
+          data.message ||
+            "Registration failed"
+        );
+
         return;
       }
 
-      setMessage("Account created successfully");
+      setMessage(
+        "Account created successfully. Please sign in."
+      );
+
       setAuthMode("login");
-    } catch {
-      setMessage("Backend connection failed");
+
+      setPassword("");
+    } catch (error) {
+      console.error(error);
+
+      setMessage(
+        "Backend connection failed"
+      );
     } finally {
       setLoading(false);
     }
   };
 
-  /* =========================================================
-     MONITORING
-  ========================================================= */
+  // ===================================================
+  // MONITORING
+  // ===================================================
 
   const toggleMonitoring = async () => {
     try {
+      setLoading(true);
+
       const endpoint = monitoring
         ? "/monitor/stop"
         : "/monitor/start";
 
       const res = await fetch(`${API}${endpoint}`, {
         method: "POST",
+        headers: authHeaders(true),
       });
+
+      if (res.status === 401 || res.status === 403) {
+        localStorage.removeItem("networkAttackToken");
+        setLoggedIn(false);
+        setPage("login");
+        return;
+      }
 
       const data = await res.json();
 
-      if (data.success) {
-        setMonitoring(data.monitoring);
-        setMessage(data.message);
-        loadDashboard();
+      if (!res.ok || !data.success) {
+        setMessage(
+          data.message || "Unable to change monitoring"
+        );
+        return;
       }
-    } catch {
+
+      const isActive =
+        data.status === "active" ||
+        data.monitoring === true;
+
+      setMonitoring(isActive);
+      setMonitorStartedAt(
+        isActive ? new Date() : null
+      );
+
+      setMessage(
+        data.message ||
+        (isActive
+          ? "Network monitoring started"
+          : "Network monitoring stopped")
+      );
+
+      await loadDashboard();
+    } catch (error) {
+      console.error("Monitoring error:", error);
       setMessage("Unable to change monitoring status");
-    }
-  };
-
-  /* =========================================================
-     ATTACK SCAN
-  ========================================================= */
-
-  const runScan = async () => {
-    try {
-      setLoading(true);
-
-      const res = await fetch(`${API}/scan`, {
-        method: "POST",
-      });
-
-      const data = await res.json();
-
-      if (data.success) {
-        setScanResults(data.detected);
-        setMessage("Attack scan completed");
-        loadDashboard();
-      }
-    } catch {
-      setMessage("Scan failed");
     } finally {
       setLoading(false);
     }
   };
 
-  /* =========================================================
-     TRAFFIC ANALYSIS
-  ========================================================= */
+  // ===================================================
+  // ATTACK SCAN
+  // ===================================================
+
+  const runScan = async () => {
+    try {
+      setLoading(true);
+      setMessage("");
+
+      const res = await fetch(`${API}/scan`, {
+        method: "POST",
+        headers: authHeaders(true),
+        body: JSON.stringify({
+          target: target.trim(),
+        }),
+      });
+
+      if (res.status === 401 || res.status === 403) {
+        localStorage.removeItem("networkAttackToken");
+        setLoggedIn(false);
+        setPage("login");
+        return;
+      }
+
+      const data = await res.json();
+
+      if (!res.ok || !data.success) {
+        setMessage(
+          data.message || "Network scan failed"
+        );
+        return;
+      }
+
+      const result = data.result || data.attack;
+
+      if (result) {
+        const attack = {
+          ...result,
+          attackType:
+            result.attackType ||
+            result.type ||
+            "Network Threat",
+          severity: result.severity || "Medium",
+          confidence: result.confidence ?? 0,
+        };
+
+        setScanResults(
+          (previous) => [attack, ...previous].slice(0, 10)
+        );
+      }
+
+      setMessage(
+        data.message || "Attack scan completed"
+      );
+
+      await loadDashboard();
+    } catch (error) {
+      console.error("Scan error:", error);
+      setMessage("Network scan failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ===================================================
+  // TRAFFIC ANALYSIS
+  // ===================================================
 
   const analyzeTraffic = async () => {
     try {
       setLoading(true);
+      setMessage("");
 
       const res = await fetch(`${API}/traffic/analyze`, {
         method: "POST",
+        headers: authHeaders(true),
+        body: JSON.stringify({
+          target: target.trim(),
+        }),
       });
+
+      if (res.status === 401 || res.status === 403) {
+        localStorage.removeItem("networkAttackToken");
+        setLoggedIn(false);
+        setPage("login");
+        return;
+      }
 
       const data = await res.json();
 
-      if (data.success) {
-        setTraffic(data.traffic);
-        setMessage("Traffic analysis completed");
-        loadDashboard();
+      if (!res.ok || !data.success) {
+        setMessage(
+          data.message || "Traffic analysis failed"
+        );
+        return;
       }
-    } catch {
+
+      const a = data.analysis || data.traffic || {};
+
+      setTraffic({
+        ...a,
+        incoming: a.incoming ?? a.totalPackets ?? 0,
+        outgoing: a.outgoing ?? 0,
+        suspicious:
+          a.suspicious ?? a.suspiciousTraffic ?? 0,
+      });
+
+      setMessage(
+        data.message || "Traffic analysis completed"
+      );
+
+      await loadDashboard();
+    } catch (error) {
+      console.error("Traffic error:", error);
       setMessage("Traffic analysis failed");
     } finally {
       setLoading(false);
     }
   };
 
-  /* =========================================================
-     THREAT INTELLIGENCE
-     ========================================================= */
+  // ===================================================
+  // THREAT INTELLIGENCE
+  // ===================================================
 
   const threatIntel = async () => {
     const value = target.trim();
@@ -255,188 +580,202 @@ function App() {
 
       const res = await fetch(`${API}/threat-intel`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: authHeaders(true),
         body: JSON.stringify({
           target: value,
         }),
       });
 
-      let data = {};
-
-      try {
-        data = await res.json();
-      } catch {
-        data = {};
-      }
-
-      if (res.ok && data.success && data.result) {
-        setIntelResult(data.result);
-        setMessage("Threat intelligence analysis completed");
+      if (res.status === 401 || res.status === 403) {
+        localStorage.removeItem("networkAttackToken");
+        setLoggedIn(false);
+        setPage("login");
         return;
       }
 
-      /*
-        Fallback analysis.
-        This keeps the Investigate button working even
-        if the backend threat-intel route is unavailable.
-      */
+      const data = await res.json();
 
-      const isIP =
-        /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(
-          value
+      if (!res.ok || !data.success) {
+        setMessage(
+          data.message || "Threat intelligence failed"
         );
+        return;
+      }
 
-      const knownSafe = [
-        "8.8.8.8",
-        "1.1.1.1",
-        "google.com",
-        "www.google.com",
-      ];
+      const result = data.result || {};
 
-      const isKnownSafe = knownSafe.includes(
-        value.toLowerCase()
-      );
-
-      const riskScore = isKnownSafe
-        ? 8
-        : isIP
-        ? 42
-        : 35;
+      const riskMap = {
+        Critical: 95,
+        High: 80,
+        Medium: 55,
+        Low: 20,
+      };
 
       setIntelResult({
-        riskScore,
+        ...result,
+        riskScore:
+          result.riskScore ??
+          riskMap[result.riskLevel] ??
+          0,
         reputation:
-          riskScore < 20
-            ? "Trusted"
-            : riskScore < 50
-            ? "Suspicious"
-            : "Malicious",
+          result.reputation ||
+          result.riskLevel ||
+          "Unknown",
         category:
-          riskScore < 20
-            ? "Legitimate"
-            : isIP
-            ? "Network Address"
-            : "Domain",
+          result.category ||
+          result.threatType ||
+          "Unknown",
         reports:
-          riskScore < 20
-            ? 0
-            : Math.floor(riskScore / 10),
+          result.reports ??
+          result.confidence ??
+          "N/A",
       });
 
-      setMessage("Threat intelligence analysis completed");
-    } catch (error) {
-      console.error(
-        "Threat Intelligence Error:",
-        error
+      setMessage(
+        "Threat intelligence analysis completed"
       );
-
-      const isIP =
-        /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(
-          value
-        );
-
-      const riskScore = isIP ? 42 : 35;
-
-      setIntelResult({
-        riskScore,
-        reputation: "Suspicious",
-        category: isIP
-          ? "Network Address"
-          : "Domain",
-        reports: 3,
-      });
-
-      setMessage("Local threat analysis completed");
+    } catch (error) {
+      console.error("Threat intelligence error:", error);
+      setMessage(
+        "Threat intelligence analysis failed"
+      );
     } finally {
       setLoading(false);
     }
   };
 
-  /* =========================================================
-     RESOLVE ALERT
-  ========================================================= */
+  // ===================================================
+  // RESOLVE ALERT
+  // ===================================================
 
   const resolveAlert = async (id) => {
+    if (!id) return;
+
     try {
       const res = await fetch(
         `${API}/alerts/${id}/resolve`,
         {
-          method: "POST",
+          method: "PATCH",
+          headers: authHeaders(true),
         }
       );
 
+      if (res.status === 401 || res.status === 403) {
+        localStorage.removeItem("networkAttackToken");
+        setLoggedIn(false);
+        setPage("login");
+        return;
+      }
+
       const data = await res.json();
 
-      if (data.success) {
-        setMessage("Alert resolved");
-        loadDashboard();
+      if (!res.ok || !data.success) {
+        setMessage(
+          data.message || "Unable to resolve alert"
+        );
+        return;
       }
-    } catch {
+
+      setMessage("Alert resolved successfully");
+      await loadDashboard();
+    } catch (error) {
+      console.error("Resolve alert error:", error);
       setMessage("Unable to resolve alert");
     }
   };
 
-  /* =========================================================
-     REPORT
-  ========================================================= */
+  // ===================================================
+  // GENERATE REPORT
+  // ===================================================
 
   const generateReport = async () => {
     try {
+      setLoading(true);
+
       const res = await fetch(`${API}/reports`, {
         method: "POST",
+        headers: authHeaders(true),
+        body: JSON.stringify({
+          type: "Network Security Report",
+        }),
       });
+
+      if (res.status === 401 || res.status === 403) {
+        localStorage.removeItem("networkAttackToken");
+        setLoggedIn(false);
+        setPage("login");
+        return;
+      }
 
       const data = await res.json();
 
-      if (data.success) {
-        setReport(data.report);
-        setMessage("Security report generated");
+      if (!res.ok || !data.success) {
+        setMessage(
+          data.message || "Report generation failed"
+        );
+        return;
       }
-    } catch {
+
+      setReport(data.report || data.data || null);
+      setMessage(
+        "Security report generated successfully"
+      );
+    } catch (error) {
+      console.error("Report error:", error);
       setMessage("Report generation failed");
+    } finally {
+      setLoading(false);
     }
   };
 
-  /* =========================================================
-     SAVE SETTINGS
-  ========================================================= */
+  // ===================================================
+  // LOGOUT
+  // ===================================================
 
-  const saveSecuritySettings = () => {
-    setSettingsSaved(true);
-
-    setMessage(
-      "Security configuration saved successfully"
+  const logout = () => {
+    localStorage.removeItem(
+      "networkAttackToken"
     );
 
-    setTimeout(() => {
-      setSettingsSaved(false);
-    }, 2500);
+    setLoggedIn(false);
+
+    setPage("dashboard");
+
+    setMonitoring(false);
+
+    setMessage("");
   };
 
-  /* =========================================================
-     LOGIN SCREEN
-  ========================================================= */
+  // ===================================================
+  // AUTH PAGE
+  // ===================================================
 
   if (!loggedIn) {
     return (
       <div className="auth-page">
+
         <div className="auth-left">
+
           <div className="brand-large">
+
             <div className="brand-icon">
               🛡
             </div>
 
             <div>
-              <h1>Network Attack</h1>
+              <h1>
+                Network Attack
+              </h1>
+
               <p>
                 Security Intelligence Platform
               </p>
             </div>
+
           </div>
 
           <div className="hero-content">
+
             <span className="hero-tag">
               CYBERSECURITY MONITORING
             </span>
@@ -448,23 +787,41 @@ function App() {
             </h2>
 
             <p>
-              Monitor suspicious activity, analyze
-              traffic, investigate threats and generate
-              security reports from one centralized
-              dashboard.
+              Monitor suspicious activity,
+              analyze traffic, investigate
+              threats and generate security
+              reports from one centralized
+              security platform.
             </p>
 
             <div className="hero-features">
-              <span>✓ Real-time Monitoring</span>
-              <span>✓ Threat Detection</span>
-              <span>✓ Traffic Analysis</span>
-              <span>✓ Security Intelligence</span>
+
+              <span>
+                ✓ Real-time Monitoring
+              </span>
+
+              <span>
+                ✓ Threat Detection
+              </span>
+
+              <span>
+                ✓ Traffic Analysis
+              </span>
+
+              <span>
+                ✓ Security Intelligence
+              </span>
+
             </div>
+
           </div>
+
         </div>
 
         <div className="auth-card">
+
           <div className="auth-heading">
+
             <h2>
               {authMode === "login"
                 ? "Welcome back"
@@ -476,6 +833,7 @@ function App() {
                 ? "Sign in to access your security dashboard."
                 : "Create your security monitoring account."}
             </p>
+
           </div>
 
           <form
@@ -485,9 +843,13 @@ function App() {
                 : register
             }
           >
+
             {authMode === "register" && (
               <div className="input-group">
-                <label>Full Name</label>
+
+                <label>
+                  Full Name
+                </label>
 
                 <input
                   value={name}
@@ -496,11 +858,15 @@ function App() {
                   }
                   placeholder="Enter your name"
                 />
+
               </div>
             )}
 
             <div className="input-group">
-              <label>Email Address</label>
+
+              <label>
+                Email Address
+              </label>
 
               <input
                 type="email"
@@ -510,10 +876,14 @@ function App() {
                 }
                 placeholder="security@example.com"
               />
+
             </div>
 
             <div className="input-group">
-              <label>Password</label>
+
+              <label>
+                Password
+              </label>
 
               <input
                 type="password"
@@ -523,6 +893,7 @@ function App() {
                 }
                 placeholder="Enter password"
               />
+
             </div>
 
             <button
@@ -535,6 +906,7 @@ function App() {
                 ? "Sign In"
                 : "Create Account"}
             </button>
+
           </form>
 
           {message && (
@@ -544,14 +916,19 @@ function App() {
           )}
 
           <div className="auth-switch">
+
             {authMode === "login" ? (
               <>
                 Don't have an account?
 
                 <button
-                  onClick={() =>
-                    setAuthMode("register")
-                  }
+                  onClick={() => {
+                    setAuthMode(
+                      "register"
+                    );
+
+                    setMessage("");
+                  }}
                 >
                   Create account
                 </button>
@@ -561,224 +938,181 @@ function App() {
                 Already have an account?
 
                 <button
-                  onClick={() =>
-                    setAuthMode("login")
-                  }
+                  onClick={() => {
+                    setAuthMode(
+                      "login"
+                    );
+
+                    setMessage("");
+                  }}
                 >
                   Sign in
                 </button>
               </>
             )}
+
           </div>
+
         </div>
+
       </div>
     );
   }
 
-  /* =========================================================
-     DASHBOARD DATA
-  ========================================================= */
+  // ===================================================
+  // DATA
+  // ===================================================
 
-  const stats = dashboard?.stats || {
-    packets: 0,
-    threats: 0,
-    blocked: 0,
-    activeConnections: 0,
-  };
+  const stats =
+    dashboard?.stats || {
+      packets: 0,
+      threats: 0,
+      blocked: 0,
+      activeAlerts: 0,
+      connections: 0,
+    };
 
-  const alerts = dashboard?.alerts || [];
+  const riskScore =
+    dashboard?.risk?.score ?? 48;
 
-  const severityData = [
+  const riskLevel =
+    dashboard?.risk?.level ||
+    "Medium";
+
+  const activeAlerts =
+    alerts.filter(
+      (alert) =>
+        alert.status === "Active"
+    );
+
+  const resolvedAlerts =
+    alerts.filter(
+      (alert) =>
+        alert.status === "Resolved"
+    );
+
+  const severityCounts = alerts.reduce(
+    (acc, alert) => {
+      const severity = alert.severity || "Medium";
+      acc[severity] = (acc[severity] || 0) + 1;
+      return acc;
+    },
+    {}
+  );
+
+  const severityData = ["Critical", "High", "Medium", "Low"].map((name) => ({
+    name,
+    value: severityCounts[name] || 0,
+  }));
+
+  const attackCounts = (alerts.length ? alerts : scanResults).reduce(
+    (acc, item) => {
+      const name =
+        item.type ||
+        item.attackType ||
+        item.title ||
+        "Other";
+      acc[name] = (acc[name] || 0) + 1;
+      return acc;
+    },
+    {}
+  );
+
+  const attackData = Object.entries(attackCounts).length
+    ? Object.entries(attackCounts).map(([name, value]) => ({ name, value }))
+    : [{ name: "No Attacks", value: 1 }];
+
+  const trafficSource =
+    dashboard?.traffic || {};
+
+  const trafficData = [
     {
-      name: "Critical",
-      value: Math.max(
-        1,
-        Math.round(stats.threats * 0.18)
-      ),
+      name: "Incoming",
+      value: Number(traffic?.incoming ?? trafficSource.incoming ?? trafficRecords.reduce((sum, item) => sum + Number(item.packetCount || 0), 0)),
     },
     {
-      name: "High",
-      value: Math.max(
-        1,
-        Math.round(stats.threats * 0.32)
-      ),
+      name: "Outgoing",
+      value: Number(traffic?.outgoing ?? trafficSource.outgoing ?? 0),
     },
     {
-      name: "Medium",
-      value: Math.max(
-        1,
-        Math.round(stats.threats * 0.35)
-      ),
-    },
-    {
-      name: "Low",
-      value: Math.max(
-        1,
-        Math.round(stats.threats * 0.15)
-      ),
+      name: "Suspicious",
+      value: Number(traffic?.suspicious ?? trafficSource.suspicious ?? trafficRecords.filter((item) => String(item.label || "BENIGN").toUpperCase() !== "BENIGN").length),
     },
   ];
 
-  const attackData = [
-    {
-      name: "Brute Force",
-      value: 8,
-    },
-    {
-      name: "Port Scan",
-      value: 6,
-    },
-    {
-      name: "Malware",
-      value: 4,
-    },
-    {
-      name: "Suspicious Traffic",
-      value: 3,
-    },
-    {
-      name: "Other",
-      value: 3,
-    },
-  ];
+  const protocolSource =
+    dashboard?.protocols || {};
 
-  const trafficData = traffic
-    ? [
-        {
-          name: "Incoming",
-          value: traffic.incoming,
-        },
-        {
-          name: "Outgoing",
-          value: traffic.outgoing,
-        },
-        {
-          name: "Suspicious",
-          value: traffic.suspicious,
-        },
-      ]
-    : [
-        {
-          name: "Incoming",
-          value: 86420,
-        },
-        {
-          name: "Outgoing",
-          value: 62500,
-        },
-        {
-          name: "Suspicious",
-          value: 1830,
-        },
-      ];
-
-  const protocolData = traffic
-    ? [
-        {
-          name: "TCP",
-          value: traffic.tcp,
-        },
-        {
-          name: "UDP",
-          value: traffic.udp,
-        },
-        {
-          name: "ICMP",
-          value: traffic.icmp,
-        },
-      ]
-    : [
-        {
-          name: "TCP",
-          value: 68,
-        },
-        {
-          name: "UDP",
-          value: 24,
-        },
-        {
-          name: "ICMP",
-          value: 8,
-        },
-      ];
+  const protocolData = Object.entries(protocolSource).length
+    ? Object.entries(protocolSource).map(([name, value]) => ({
+        name,
+        value: Number(value || 0),
+      }))
+    : [{ name: "No Data", value: 1 }];
 
   const alertStatusData = [
     {
       name: "Active",
-      value: alerts.filter(
-        (a) => a.status === "Active"
-      ).length,
+      value:
+        activeAlerts.length,
     },
+
     {
       name: "Resolved",
-      value: alerts.filter(
-        (a) => a.status === "Resolved"
-      ).length,
+      value:
+        resolvedAlerts.length,
     },
   ];
 
-  const activityData = [
-    {
-      time: "08:00",
-      threats: 3,
-      packets: 32,
-    },
-    {
-      time: "10:00",
-      threats: 5,
-      packets: 45,
-    },
-    {
-      time: "12:00",
-      threats: 4,
-      packets: 38,
-    },
-    {
-      time: "14:00",
-      threats: 8,
-      packets: 62,
-    },
-    {
-      time: "16:00",
-      threats: 6,
-      packets: 51,
-    },
-    {
-      time: "18:00",
-      threats: 9,
-      packets: 74,
-    },
-  ];
+  const activityBuckets = {};
 
-  const pageTitle = {
-    dashboard: "Security Dashboard",
-    monitor: "Network Monitor",
-    attacks: "Attack Detection",
-    traffic: "Traffic Analysis",
-    intel: "Threat Intelligence",
-    alerts: "Security Alerts",
-    reports: "Security Reports",
-    settings: "Security Control Center",
-  };
+  trafficRecords.forEach((item) => {
+    const date = item.timestamp ? new Date(item.timestamp) : new Date();
+    const hour = date.getHours();
+    const time = `${String(hour).padStart(2, "0")}:00`;
 
-  /* =========================================================
-     SIDEBAR
-  ========================================================= */
+    if (!activityBuckets[time]) {
+      activityBuckets[time] = { time, threats: 0, packets: 0 };
+    }
+
+    activityBuckets[time].packets += Number(item.packetCount || 0);
+
+    if (String(item.label || "BENIGN").toUpperCase() !== "BENIGN") {
+      activityBuckets[time].threats += 1;
+    }
+  });
+
+  const activityData = Object.values(activityBuckets).sort((a, b) =>
+    a.time.localeCompare(b.time)
+  );
+
+  // ===================================================
+  // SIDEBAR
+  // ===================================================
 
   const Sidebar = () => (
     <aside className="sidebar">
+
       <div className="sidebar-brand">
+
         <div className="brand-icon small">
           🛡
         </div>
 
         <div>
-          <strong>Network Attack</strong>
-          <span>Security Platform</span>
+          <strong>
+            Network Attack
+          </strong>
+
+          <span>
+            Security Platform
+          </span>
         </div>
+
       </div>
 
       <div className="sidebar-section">
+
         <span className="sidebar-label">
           OVERVIEW
         </span>
@@ -838,9 +1172,11 @@ function App() {
           <span>⌁</span>
           Traffic Analysis
         </button>
+
       </div>
 
       <div className="sidebar-section">
+
         <span className="sidebar-label">
           INTELLIGENCE
         </span>
@@ -872,15 +1208,9 @@ function App() {
           <span>♢</span>
           Alerts
 
-          {alerts.filter(
-            (a) => a.status === "Active"
-          ).length > 0 && (
+          {activeAlerts.length > 0 && (
             <b className="nav-badge">
-              {
-                alerts.filter(
-                  (a) => a.status === "Active"
-                ).length
-              }
+              {activeAlerts.length}
             </b>
           )}
         </button>
@@ -898,9 +1228,11 @@ function App() {
           <span>▤</span>
           Reports
         </button>
+
       </div>
 
       <div className="sidebar-bottom">
+
         <button
           className={
             page === "settings"
@@ -917,34 +1249,66 @@ function App() {
 
         <button
           className="nav logout"
-          onClick={() => {
-            setLoggedIn(false);
-            setPage("dashboard");
-          }}
+          onClick={logout}
         >
           <span>↪</span>
           Logout
         </button>
+
       </div>
+
     </aside>
   );
 
-  /* =========================================================
-     HEADER
-  ========================================================= */
+  // ===================================================
+  // HEADER
+  // ===================================================
+
+  const pageTitle = {
+    dashboard:
+      "Security Dashboard",
+
+    monitor:
+      "Network Monitor",
+
+    attacks:
+      "Attack Detection",
+
+    traffic:
+      "Traffic Analysis",
+
+    intel:
+      "Threat Intelligence",
+
+    alerts:
+      "Security Alerts",
+
+    reports:
+      "Security Reports",
+
+    settings:
+      "Settings",
+  };
 
   const Header = () => (
     <header className="topbar">
+
       <div>
-        <h1>{pageTitle[page]}</h1>
+
+        <h1>
+          {pageTitle[page]}
+        </h1>
 
         <p>
           Network security operations center
         </p>
+
       </div>
 
       <div className="header-actions">
+
         <div className="system-status">
+
           <span
             className={
               monitoring
@@ -956,41 +1320,61 @@ function App() {
           {monitoring
             ? "Monitoring Active"
             : "Monitoring Offline"}
+
         </div>
 
         <div className="user-profile">
+
           <div className="avatar">
-            {email.charAt(0).toUpperCase() ||
-              "A"}
+            {email
+              ? email
+                  .charAt(0)
+                  .toUpperCase()
+              : "A"}
           </div>
 
           <div>
+
             <strong>
-              {email.split("@")[0] ||
-                "Admin"}
+              {email
+                ? email.split("@")[0]
+                : "Admin"}
             </strong>
 
-            <span>Security Analyst</span>
+            <span>
+              Security Analyst
+            </span>
+
           </div>
+
         </div>
+
       </div>
+
     </header>
   );
 
-  /* =========================================================
-     DASHBOARD
-  ========================================================= */
+  // ===================================================
+  // DASHBOARD
+  // ===================================================
 
   const Dashboard = () => (
     <>
+
       <div className="welcome-row">
+
         <div>
-          <h2>Security Overview</h2>
+
+          <h2>
+            Security Overview
+          </h2>
 
           <p>
-            Monitor your network health and
-            security activity in real time.
+            Monitor your network health
+            and security activity in real
+            time.
           </p>
+
         </div>
 
         <button
@@ -999,12 +1383,16 @@ function App() {
               ? "danger-btn"
               : "primary-btn compact"
           }
-          onClick={toggleMonitoring}
+          onClick={
+            toggleMonitoring
+          }
+          disabled={loading}
         >
           {monitoring
             ? "■ Stop Monitoring"
             : "▶ Start Monitoring"}
         </button>
+
       </div>
 
       {message && (
@@ -1014,80 +1402,141 @@ function App() {
       )}
 
       <div className="stat-grid">
+
         <div className="stat-card purple">
+
           <div className="stat-icon">
             ⌁
           </div>
 
           <div>
-            <span>Total Packets</span>
+
+            <span>
+              Total Packets
+            </span>
+
             <strong>
-              {stats.packets.toLocaleString()}
+              {Number(
+                stats.packets
+              ).toLocaleString()}
             </strong>
-            <small>Network traffic</small>
+
+            <small>
+              Network traffic
+            </small>
+
           </div>
+
         </div>
 
         <div className="stat-card red">
+
           <div className="stat-icon">
             ⚠
           </div>
 
           <div>
-            <span>Threats Detected</span>
-            <strong>{stats.threats}</strong>
-            <small>Security events</small>
+
+            <span>
+              Threats Detected
+            </span>
+
+            <strong>
+              {stats.threats}
+            </strong>
+
+            <small>
+              Security events
+            </small>
+
           </div>
+
         </div>
 
         <div className="stat-card green">
+
           <div className="stat-icon">
             ✓
           </div>
 
           <div>
-            <span>Threats Blocked</span>
-            <strong>{stats.blocked}</strong>
-            <small>Successfully blocked</small>
+
+            <span>
+              Threats Blocked
+            </span>
+
+            <strong>
+              {stats.blocked}
+            </strong>
+
+            <small>
+              Successfully blocked
+            </small>
+
           </div>
+
         </div>
 
         <div className="stat-card blue">
+
           <div className="stat-icon">
             ◉
           </div>
 
           <div>
-            <span>Active Connections</span>
+
+            <span>
+              Active Connections
+            </span>
+
             <strong>
-              {stats.activeConnections}
+              {Number(
+                stats.connections
+              ).toLocaleString()}
             </strong>
-            <small>Current connections</small>
+
+            <small>
+              Current connections
+            </small>
+
           </div>
+
         </div>
+
       </div>
 
       <div className="chart-grid">
+
         <div className="panel chart-panel">
+
           <div className="panel-header">
+
             <div>
-              <h3>Threat Severity</h3>
+
+              <h3>
+                Threat Severity
+              </h3>
+
               <p>
                 Current threat distribution
               </p>
+
             </div>
 
             <span className="live-badge">
               LIVE
             </span>
+
           </div>
 
           <div className="pie-container">
+
             <ResponsiveContainer
               width="100%"
               height={260}
             >
               <PieChart>
+
                 <Pie
                   data={severityData}
                   dataKey="value"
@@ -1102,7 +1551,9 @@ function App() {
                     (entry, index) => (
                       <Cell
                         key={entry.name}
-                        fill={COLORS[index]}
+                        fill={
+                          COLORS[index]
+                        }
                       />
                     )
                   )}
@@ -1114,28 +1565,42 @@ function App() {
                   verticalAlign="bottom"
                   height={36}
                 />
+
               </PieChart>
             </ResponsiveContainer>
 
             <div className="pie-center">
+
               <strong>
                 {stats.threats}
               </strong>
 
-              <span>Threats</span>
+              <span>
+                Threats
+              </span>
+
             </div>
+
           </div>
+
         </div>
 
         <div className="panel chart-panel">
+
           <div className="panel-header">
+
             <div>
-              <h3>Attack Types</h3>
+
+              <h3>
+                Attack Types
+              </h3>
 
               <p>
                 Detected attack categories
               </p>
+
             </div>
+
           </div>
 
           <ResponsiveContainer
@@ -1143,6 +1608,7 @@ function App() {
             height={300}
           >
             <PieChart>
+
               <Pie
                 data={attackData}
                 dataKey="value"
@@ -1156,7 +1622,9 @@ function App() {
                   (entry, index) => (
                     <Cell
                       key={entry.name}
-                      fill={COLORS[index]}
+                      fill={
+                        COLORS[index]
+                      }
                     />
                   )
                 )}
@@ -1168,87 +1636,129 @@ function App() {
                 verticalAlign="bottom"
                 height={45}
               />
+
             </PieChart>
           </ResponsiveContainer>
+
         </div>
+
       </div>
 
-      {/* EXTRA PIE CHARTS */}
-
       <div className="chart-grid">
+
         <div className="panel chart-panel">
+
           <div className="panel-header">
+
             <div>
-              <h3>Alert Status</h3>
+
+              <h3>
+                Alert Status
+              </h3>
 
               <p>
-                Active and resolved security alerts
+                Active and resolved
+                security alerts
               </p>
+
             </div>
+
+            <span className="live-badge">
+              STATUS
+            </span>
+
           </div>
 
           <div className="pie-container">
-            {alerts.length > 0 ? (
-              <ResponsiveContainer
-                width="100%"
-                height={260}
-              >
-                <PieChart>
-                  <Pie
-                    data={alertStatusData}
-                    dataKey="value"
-                    nameKey="name"
-                    cx="50%"
-                    cy="50%"
-                    innerRadius={65}
-                    outerRadius={100}
-                    paddingAngle={5}
-                  >
-                    <Cell fill="#ef4444" />
-                    <Cell fill="#22c55e" />
-                  </Pie>
 
-                  <Tooltip />
-
-                  <Legend
-                    verticalAlign="bottom"
-                    height={36}
-                  />
-                </PieChart>
-              </ResponsiveContainer>
-            ) : (
-              <div className="empty-state">
-                No alerts available
-              </div>
-            )}
-
-            <div className="pie-center">
-              <strong>
-                {alerts.length}
-              </strong>
-
-              <span>Alerts</span>
-            </div>
-          </div>
-        </div>
-
-        <div className="panel chart-panel">
-          <div className="panel-header">
-            <div>
-              <h3>Network Protocols</h3>
-
-              <p>
-                Current protocol distribution
-              </p>
-            </div>
-          </div>
-
-          <div className="pie-container">
             <ResponsiveContainer
               width="100%"
               height={260}
             >
               <PieChart>
+
+                <Pie
+                  data={
+                    alertStatusData
+                  }
+                  dataKey="value"
+                  nameKey="name"
+                  cx="50%"
+                  cy="50%"
+                  innerRadius={65}
+                  outerRadius={100}
+                  paddingAngle={5}
+                >
+                  {alertStatusData.map(
+                    (entry, index) => (
+                      <Cell
+                        key={entry.name}
+                        fill={
+                          index === 0
+                            ? "#ef4444"
+                            : "#22c55e"
+                        }
+                      />
+                    )
+                  )}
+                </Pie>
+
+                <Tooltip />
+
+                <Legend
+                  verticalAlign="bottom"
+                  height={36}
+                />
+
+              </PieChart>
+            </ResponsiveContainer>
+
+            <div className="pie-center">
+
+              <strong>
+                {alerts.length}
+              </strong>
+
+              <span>
+                Alerts
+              </span>
+
+            </div>
+
+          </div>
+
+        </div>
+
+        <div className="panel chart-panel">
+
+          <div className="panel-header">
+
+            <div>
+
+              <h3>
+                Network Protocols
+              </h3>
+
+              <p>
+                Protocol distribution
+              </p>
+
+            </div>
+
+            <span className="live-badge">
+              NETWORK
+            </span>
+
+          </div>
+
+          <div className="pie-container">
+
+            <ResponsiveContainer
+              width="100%"
+              height={260}
+            >
+              <PieChart>
+
                 <Pie
                   data={protocolData}
                   dataKey="value"
@@ -1263,7 +1773,9 @@ function App() {
                     (entry, index) => (
                       <Cell
                         key={entry.name}
-                        fill={COLORS[index]}
+                        fill={
+                          COLORS[index]
+                        }
                       />
                     )
                   )}
@@ -1275,42 +1787,69 @@ function App() {
                   verticalAlign="bottom"
                   height={36}
                 />
+
               </PieChart>
             </ResponsiveContainer>
 
             <div className="pie-center">
-              <strong>100%</strong>
-              <span>Protocols</span>
+
+              <strong>
+                3
+              </strong>
+
+              <span>
+                Protocols
+              </span>
+
             </div>
+
           </div>
+
         </div>
+
       </div>
 
       <div className="chart-grid">
+
         <div className="panel">
+
           <div className="panel-header">
+
             <div>
-              <h3>Security Activity</h3>
+
+              <h3>
+                Security Activity
+              </h3>
 
               <p>
-                Threat activity throughout the day
+                Threat activity throughout
+                the day
               </p>
+
             </div>
+
           </div>
 
           <ResponsiveContainer
             width="100%"
             height={300}
           >
-            <LineChart data={activityData}>
+            <LineChart
+              data={activityData}
+            >
+
               <CartesianGrid
                 strokeDasharray="3 3"
               />
 
-              <XAxis dataKey="time" />
+              <XAxis
+                dataKey="time"
+              />
+
               <YAxis />
 
               <Tooltip />
+
               <Legend />
 
               <Line
@@ -1319,7 +1858,6 @@ function App() {
                 name="Threats"
                 stroke="#ef4444"
                 strokeWidth={3}
-                dot={{ r: 4 }}
               />
 
               <Line
@@ -1328,53 +1866,79 @@ function App() {
                 name="Traffic"
                 stroke="#6366f1"
                 strokeWidth={3}
-                dot={{ r: 4 }}
               />
+
             </LineChart>
           </ResponsiveContainer>
+
         </div>
 
         <div className="panel">
+
           <div className="panel-header">
+
             <div>
-              <h3>Traffic Distribution</h3>
+
+              <h3>
+                Traffic Distribution
+              </h3>
 
               <p>
-                Incoming and outgoing network
+                Incoming and outgoing
                 traffic
               </p>
+
             </div>
+
           </div>
 
           <ResponsiveContainer
             width="100%"
             height={300}
           >
-            <BarChart data={trafficData}>
+            <BarChart
+              data={trafficData}
+            >
+
               <CartesianGrid
                 strokeDasharray="3 3"
               />
 
-              <XAxis dataKey="name" />
+              <XAxis
+                dataKey="name"
+              />
+
               <YAxis />
 
               <Tooltip />
 
               <Bar
                 dataKey="value"
-                name="Packets"
-                radius={[8, 8, 0, 0]}
+                name="Traffic"
                 fill="#6366f1"
+                radius={[
+                  8,
+                  8,
+                  0,
+                  0,
+                ]}
               />
+
             </BarChart>
           </ResponsiveContainer>
+
         </div>
+
       </div>
 
       <div className="bottom-grid">
+
         <div className="panel">
+
           <div className="panel-header">
+
             <div>
+
               <h3>
                 Recent Security Alerts
               </h3>
@@ -1382,6 +1946,7 @@ function App() {
               <p>
                 Latest detected events
               </p>
+
             </div>
 
             <button
@@ -1392,9 +1957,11 @@ function App() {
             >
               View all →
             </button>
+
           </div>
 
           <div className="alert-list">
+
             {alerts.length === 0 ? (
               <div className="empty-state">
                 No alerts available
@@ -1405,78 +1972,120 @@ function App() {
                 .map((alert) => (
                   <div
                     className="alert-row"
-                    key={alert.id}
+                    key={
+                      alert._id ||
+                      alert.id
+                    }
                   >
+
                     <div className="alert-icon">
                       !
                     </div>
 
                     <div className="alert-main">
+
                       <strong>
-                        {alert.type}
+                        {alert.type ||
+                          alert.title}
                       </strong>
 
                       <span>
+                        Source:{" "}
                         {alert.source}
                       </span>
+
                     </div>
 
                     <span
-                      className={`severity ${alert.severity.toLowerCase()}`}
+                      className={`severity ${
+                        alert.severity?.toLowerCase() ||
+                        "medium"
+                      }`}
                     >
                       {alert.severity}
                     </span>
 
                     <span className="alert-time">
-                      {alert.time}
+                      {alert.createdAt
+                        ? new Date(
+                            alert.createdAt
+                          ).toLocaleTimeString(
+                            [],
+                            {
+                              hour:
+                                "2-digit",
+                              minute:
+                                "2-digit",
+                            }
+                          )
+                        : "Now"}
                     </span>
+
                   </div>
                 ))
             )}
+
           </div>
+
         </div>
 
         <div className="panel quick-panel">
+
           <div className="panel-header">
+
             <div>
-              <h3>Quick Actions</h3>
+
+              <h3>
+                Quick Actions
+              </h3>
 
               <p>
                 Security operations
               </p>
+
             </div>
+
           </div>
 
           <button
             className="quick-action"
             onClick={runScan}
           >
+
             <span className="qa-icon red-bg">
               ⚡
             </span>
 
             <div>
+
               <strong>
                 Run Attack Scan
               </strong>
 
               <small>
-                Detect suspicious activity
+                Detect suspicious
+                activity
               </small>
+
             </div>
 
-            <span>→</span>
+            <span>
+              →
+            </span>
+
           </button>
 
           <button
             className="quick-action"
             onClick={analyzeTraffic}
           >
+
             <span className="qa-icon blue-bg">
               ⌁
             </span>
 
             <div>
+
               <strong>
                 Analyze Traffic
               </strong>
@@ -1484,20 +2093,26 @@ function App() {
               <small>
                 Inspect network packets
               </small>
+
             </div>
 
-            <span>→</span>
+            <span>
+              →
+            </span>
+
           </button>
 
           <button
             className="quick-action"
             onClick={generateReport}
           >
+
             <span className="qa-icon green-bg">
               ▤
             </span>
 
             <div>
+
               <strong>
                 Generate Report
               </strong>
@@ -1505,323 +2120,76 @@ function App() {
               <small>
                 Create security report
               </small>
+
             </div>
 
-            <span>→</span>
+            <span>
+              →
+            </span>
+
           </button>
+
         </div>
+
       </div>
+
     </>
   );
 
-  /* =========================================================
-     SIMPLE PAGE
-  ========================================================= */
-
-  const SimplePage = ({
-    title,
-    description,
-    children,
-  }) => (
-    <>
-      <div className="welcome-row">
-        <div>
-          <h2>{title}</h2>
-          <p>{description}</p>
-        </div>
-
-        <button
-          className="secondary-btn"
-          onClick={() =>
-            setPage("dashboard")
-          }
-        >
-          ← Back to Dashboard
-        </button>
-      </div>
-
-      {children}
-    </>
-  );
-
-  /* =========================================================
-     PAGE ROUTING
-  ========================================================= */
+  // ===================================================
+  // RENDER PAGES
+  // ===================================================
 
   const renderPage = () => {
-    /* -------------------------------------------------------
-       DASHBOARD
-    ------------------------------------------------------- */
+
+    // =================================================
+    // DASHBOARD
+    // =================================================
 
     if (page === "dashboard") {
       return <Dashboard />;
     }
 
-    /* -------------------------------------------------------
-       NETWORK MONITOR
-    ------------------------------------------------------- */
+    // =================================================
+    // NETWORK MONITOR
+    // =================================================
 
     if (page === "monitor") {
+
+      const incoming =
+        Number(
+          trafficData[0]?.value || 0
+        );
+
+      const outgoing =
+        Number(
+          trafficData[1]?.value || 0
+        );
+
+      const suspicious =
+        Number(
+          trafficData[2]?.value || 0
+        );
+
+      const maximum =
+        Math.max(
+          incoming,
+          outgoing,
+          suspicious,
+          1
+        );
+
+      const healthGood =
+        riskScore < 55;
+
       return (
         <SimplePage
           title="Network Monitor"
-          description="Control real-time network monitoring."
+          description="Control and observe real-time network monitoring."
+          onBack={() =>
+            setPage("dashboard")
+          }
         >
-          <div className="large-action-panel">
-            <div className="monitor-status">
-              <div
-                className={
-                  monitoring
-                    ? "big-status active"
-                    : "big-status"
-                }
-              >
-                {monitoring ? "●" : "○"}
-              </div>
-
-              <h3>
-                {monitoring
-                  ? "Network Monitoring Active"
-                  : "Network Monitoring Offline"}
-              </h3>
-
-              <p>
-                {monitoring
-                  ? "Your network is currently being monitored."
-                  : "Start monitoring to begin observing network activity."}
-              </p>
-
-              <button
-                className={
-                  monitoring
-                    ? "danger-btn"
-                    : "primary-btn"
-                }
-                onClick={toggleMonitoring}
-              >
-                {monitoring
-                  ? "Stop Monitoring"
-                  : "Start Monitoring"}
-              </button>
-            </div>
-          </div>
-        </SimplePage>
-      );
-    }
-
-    /* -------------------------------------------------------
-       ATTACK DETECTION
-    ------------------------------------------------------- */
-
-    if (page === "attacks") {
-      return (
-        <SimplePage
-          title="Attack Detection"
-          description="Scan the network for potential attacks."
-        >
-          <div className="action-card">
-            <div>
-              <h3>
-                Network Attack Scanner
-              </h3>
-
-              <p>
-                Run a security scan to detect
-                suspicious network activity.
-              </p>
-            </div>
-
-            <button
-              className="primary-btn"
-              onClick={runScan}
-            >
-              {loading
-                ? "Scanning..."
-                : "Run Attack Scan"}
-            </button>
-          </div>
-
-          {scanResults.length > 0 && (
-            <div className="panel">
-              <div className="panel-header">
-                <h3>Detected Threats</h3>
-              </div>
-
-              <div className="table-wrapper">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Attack</th>
-                      <th>Source</th>
-                      <th>Destination</th>
-                      <th>Severity</th>
-                      <th>Confidence</th>
-                    </tr>
-                  </thead>
-
-                  <tbody>
-                    {scanResults.map(
-                      (item, index) => (
-                        <tr key={index}>
-                          <td>{item.type}</td>
-
-                          <td>{item.source}</td>
-
-                          <td>
-                            {item.destination}
-                          </td>
-
-                          <td>
-                            <span
-                              className={`severity ${item.severity.toLowerCase()}`}
-                            >
-                              {item.severity}
-                            </span>
-                          </td>
-
-                          <td>
-                            {item.confidence}
-                          </td>
-                        </tr>
-                      )
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-        </SimplePage>
-      );
-    }
-
-    /* -------------------------------------------------------
-       TRAFFIC ANALYSIS
-    ------------------------------------------------------- */
-
-    if (page === "traffic") {
-      return (
-        <SimplePage
-          title="Traffic Analysis"
-          description="Analyze network packet distribution and protocols."
-        >
-          <div className="action-card">
-            <div>
-              <h3>Traffic Analyzer</h3>
-
-              <p>
-                Inspect incoming, outgoing and
-                suspicious network traffic.
-              </p>
-            </div>
-
-            <button
-              className="primary-btn"
-              onClick={analyzeTraffic}
-            >
-              {loading
-                ? "Analyzing..."
-                : "Analyze Traffic"}
-            </button>
-          </div>
-
-          <div className="chart-grid">
-            <div className="panel">
-              <div className="panel-header">
-                <h3>
-                  Protocol Distribution
-                </h3>
-              </div>
-
-              <ResponsiveContainer
-                width="100%"
-                height={330}
-              >
-                <PieChart>
-                  <Pie
-                    data={protocolData}
-                    dataKey="value"
-                    nameKey="name"
-                    innerRadius={65}
-                    outerRadius={110}
-                    paddingAngle={5}
-                  >
-                    {protocolData.map(
-                      (item, index) => (
-                        <Cell
-                          key={item.name}
-                          fill={COLORS[index]}
-                        />
-                      )
-                    )}
-                  </Pie>
-
-                  <Tooltip />
-                  <Legend />
-                </PieChart>
-              </ResponsiveContainer>
-            </div>
-
-            <div className="panel">
-              <div className="panel-header">
-                <h3>Traffic Volume</h3>
-              </div>
-
-              <ResponsiveContainer
-                width="100%"
-                height={330}
-              >
-                <BarChart data={trafficData}>
-                  <CartesianGrid
-                    strokeDasharray="3 3"
-                  />
-
-                  <XAxis dataKey="name" />
-                  <YAxis />
-
-                  <Tooltip />
-
-                  <Bar
-                    dataKey="value"
-                    fill="#06b6d4"
-                    radius={[8, 8, 0, 0]}
-                  />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-        </SimplePage>
-      );
-    }
-
-    /* -------------------------------------------------------
-       THREAT INTELLIGENCE
-    ------------------------------------------------------- */
-
-    if (page === "intel") {
-      return (
-        <SimplePage
-          title="Threat Intelligence"
-          description="Investigate an IP address or domain."
-        >
-          <div className="intel-box">
-            <input
-              value={target}
-              onChange={(e) =>
-                setTarget(e.target.value)
-              }
-              placeholder="Enter IP address or domain"
-            />
-
-            <button
-              className="primary-btn"
-              onClick={threatIntel}
-              disabled={loading}
-            >
-              {loading
-                ? "Investigating..."
-                : "Investigate"}
-            </button>
-          </div>
 
           {message && (
             <div className="toast-message">
@@ -1829,717 +2197,2125 @@ function App() {
             </div>
           )}
 
-          {intelResult && (
-            <div className="intel-result">
-              <div className="risk-score">
-                <strong>
-                  {intelResult.riskScore}
-                </strong>
+          {/* =========================================
+              MONITOR CONTROL PANEL
+          ========================================= */}
 
-                <span>Risk Score</span>
-              </div>
+          <div
+            className="panel"
+            style={{
+              padding: "28px",
+              marginBottom: "18px",
+              background:
+                "linear-gradient(135deg, rgba(9,28,46,0.98), rgba(5,17,30,0.98))",
+              border:
+                "1px solid rgba(65,183,255,0.12)",
+            }}
+          >
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns:
+                  "minmax(0, 1fr) 280px",
+                gap: "30px",
+                alignItems: "center",
+              }}
+            >
+
+              {/* LEFT */}
 
               <div>
-                <span>Reputation</span>
 
-                <strong>
-                  {intelResult.reputation}
-                </strong>
+                <div
+                  style={{
+                    display:
+                      "inline-flex",
+                    alignItems:
+                      "center",
+                    gap: "8px",
+                    padding:
+                      "7px 12px",
+                    borderRadius:
+                      "999px",
+                    border: monitoring
+                      ? "1px solid rgba(34,197,94,0.25)"
+                      : "1px solid rgba(100,116,139,0.2)",
+                    background:
+                      monitoring
+                        ? "rgba(34,197,94,0.08)"
+                        : "rgba(100,116,139,0.08)",
+                    color:
+                      monitoring
+                        ? "#4ade80"
+                        : "#94a3b8",
+                    fontSize:
+                      "10px",
+                    fontWeight: 700,
+                    letterSpacing:
+                      "1px",
+                    textTransform:
+                      "uppercase",
+                    marginBottom:
+                      "16px",
+                  }}
+                >
+
+                  <span
+                    style={{
+                      width: "7px",
+                      height: "7px",
+                      borderRadius:
+                        "50%",
+                      background:
+                        monitoring
+                          ? "#4ade80"
+                          : "#64748b",
+                      boxShadow:
+                        monitoring
+                          ? "0 0 12px rgba(74,222,128,0.8)"
+                          : "none",
+                    }}
+                  />
+
+                  {monitoring
+                    ? "Sensor Online"
+                    : "Sensor Offline"}
+
+                </div>
+
+                <h3
+                  style={{
+                    fontSize:
+                      "28px",
+                    margin:
+                      "0 0 10px",
+                    color:
+                      "#e8f2ff",
+                  }}
+                >
+                  {monitoring
+                    ? "Network monitoring is active"
+                    : "Network monitoring is offline"}
+                </h3>
+
+                <p
+                  style={{
+                    margin:
+                      "0 0 22px",
+                    maxWidth:
+                      "650px",
+                    color:
+                      "var(--muted)",
+                    fontSize:
+                      "13px",
+                    lineHeight:
+                      1.7,
+                  }}
+                >
+                  {monitoring
+                    ? "The security sensor is currently observing network activity. Dashboard statistics are refreshed automatically."
+                    : "The monitoring sensor is currently in standby. Start monitoring to begin observing network activity."}
+                </p>
+
+                <button
+                  className={
+                    monitoring
+                      ? "danger-btn"
+                      : "primary-btn"
+                  }
+                  onClick={
+                    toggleMonitoring
+                  }
+                  disabled={loading}
+                >
+                  {loading
+                    ? "Processing..."
+                    : monitoring
+                    ? "■ Stop Monitoring"
+                    : "▶ Start Monitoring"}
+                </button>
+
               </div>
 
-              <div>
-                <span>Category</span>
+              {/* RIGHT STATUS */}
 
-                <strong>
-                  {intelResult.category}
-                </strong>
+              <div
+                style={{
+                  display:
+                    "flex",
+                  justifyContent:
+                    "center",
+                  alignItems:
+                    "center",
+                }}
+              >
+
+                <div
+                  style={{
+                    width:
+                      "170px",
+                    height:
+                      "170px",
+                    borderRadius:
+                      "50%",
+                    display:
+                      "grid",
+                    placeItems:
+                      "center",
+                    border:
+                      monitoring
+                        ? "1px solid rgba(34,197,94,0.30)"
+                        : "1px solid rgba(100,116,139,0.20)",
+                    background:
+                      monitoring
+                        ? "radial-gradient(circle, rgba(34,197,94,0.16), rgba(34,197,94,0.03) 55%, transparent 65%)"
+                        : "radial-gradient(circle, rgba(100,116,139,0.12), rgba(100,116,139,0.03) 55%, transparent 65%)",
+                    boxShadow:
+                      monitoring
+                        ? "0 0 50px rgba(34,197,94,0.12)"
+                        : "none",
+                  }}
+                >
+
+                  <div
+                    style={{
+                      textAlign:
+                        "center",
+                    }}
+                  >
+
+                    <div
+                      style={{
+                        fontSize:
+                          "32px",
+                        fontWeight:
+                          800,
+                        color:
+                          monitoring
+                            ? "#4ade80"
+                            : "#64748b",
+                      }}
+                    >
+                      {monitoring
+                        ? "ON"
+                        : "OFF"}
+                    </div>
+
+                    <div
+                      style={{
+                        fontSize:
+                          "9px",
+                        letterSpacing:
+                          "1.2px",
+                        textTransform:
+                          "uppercase",
+                        color:
+                          "var(--muted)",
+                        marginTop:
+                          "5px",
+                      }}
+                    >
+                      Network Sensor
+                    </div>
+
+                  </div>
+
+                </div>
+
               </div>
 
-              <div>
-                <span>Reports</span>
-
-                <strong>
-                  {intelResult.reports}
-                </strong>
-              </div>
             </div>
-          )}
+
+          </div>
+
+          {/* =========================================
+              MONITOR STAT CARDS
+          ========================================= */}
+
+          <div
+            className="stat-grid"
+            style={{
+              marginBottom:
+                "18px",
+            }}
+          >
+
+            <div className="stat-card purple">
+
+              <div className="stat-icon">
+                ⌁
+              </div>
+
+              <div>
+
+                <span>
+                  Packets Observed
+                </span>
+
+                <strong>
+                  {Number(
+                    stats.packets
+                  ).toLocaleString()}
+                </strong>
+
+                <small>
+                  Total network packets
+                </small>
+
+              </div>
+
+            </div>
+
+            <div className="stat-card blue">
+
+              <div className="stat-icon">
+                ◉
+              </div>
+
+              <div>
+
+                <span>
+                  Active Connections
+                </span>
+
+                <strong>
+                  {Number(
+                    stats.connections
+                  ).toLocaleString()}
+                </strong>
+
+                <small>
+                  Current connections
+                </small>
+
+              </div>
+
+            </div>
+
+            <div className="stat-card red">
+
+              <div className="stat-icon">
+                ⚠
+              </div>
+
+              <div>
+
+                <span>
+                  Threats Detected
+                </span>
+
+                <strong>
+                  {stats.threats}
+                </strong>
+
+                <small>
+                  Security events
+                </small>
+
+              </div>
+
+            </div>
+
+            <div className="stat-card green">
+
+              <div className="stat-icon">
+                ✓
+              </div>
+
+              <div>
+
+                <span>
+                  Threats Blocked
+                </span>
+
+                <strong>
+                  {stats.blocked}
+                </strong>
+
+                <small>
+                  Successfully contained
+                </small>
+
+              </div>
+
+            </div>
+
+          </div>
+
+          {/* =========================================
+              MONITORING HEALTH + TRAFFIC
+          ========================================= */}
+
+          <div className="chart-grid">
+
+            {/* NETWORK ACTIVITY */}
+
+            <div
+              className="panel"
+              style={{
+                padding:
+                  "24px",
+              }}
+            >
+
+              <div className="panel-header">
+
+                <div>
+
+                  <h3>
+                    Network Activity
+                  </h3>
+
+                  <p>
+                    Current traffic distribution
+                  </p>
+
+                </div>
+
+                <span className="live-badge">
+                  {monitoring
+                    ? "LIVE"
+                    : "STANDBY"}
+                </span>
+
+              </div>
+
+              <div
+                style={{
+                  marginTop:
+                    "20px",
+                }}
+              >
+
+                {[
+                  {
+                    label:
+                      "Incoming Traffic",
+                    value:
+                      incoming,
+                    accent:
+                      "#06b6d4",
+                  },
+
+                  {
+                    label:
+                      "Outgoing Traffic",
+                    value:
+                      outgoing,
+                    accent:
+                      "#6366f1",
+                  },
+
+                  {
+                    label:
+                      "Suspicious Traffic",
+                    value:
+                      suspicious,
+                    accent:
+                      "#ef4444",
+                  },
+                ].map(
+                  (item) => (
+                    <div
+                      key={
+                        item.label
+                      }
+                      style={{
+                        marginBottom:
+                          "22px",
+                      }}
+                    >
+
+                      <div
+                        style={{
+                          display:
+                            "flex",
+                          justifyContent:
+                            "space-between",
+                          marginBottom:
+                            "8px",
+                        }}
+                      >
+
+                        <span
+                          style={{
+                            color:
+                              "var(--muted)",
+                            fontSize:
+                              "11px",
+                          }}
+                        >
+                          {item.label}
+                        </span>
+
+                        <strong
+                          style={{
+                            fontSize:
+                              "12px",
+                          }}
+                        >
+                          {Number(
+                            item.value
+                          ).toLocaleString()}
+                        </strong>
+
+                      </div>
+
+                      <div
+                        style={{
+                          height:
+                            "8px",
+                          borderRadius:
+                            "999px",
+                          background:
+                            "rgba(255,255,255,0.06)",
+                          overflow:
+                            "hidden",
+                        }}
+                      >
+
+                        <div
+                          style={{
+                            width: `${Math.max(
+                              4,
+                              Math.round(
+                                (item.value /
+                                  maximum) *
+                                  100
+                              )
+                            )}%`,
+                            height:
+                              "100%",
+                            borderRadius:
+                              "999px",
+                            background:
+                              item.accent,
+                            boxShadow:
+                              `0 0 12px ${item.accent}`,
+                            transition:
+                              "width 0.5s ease",
+                          }}
+                        />
+
+                      </div>
+
+                    </div>
+                  )
+                )}
+
+              </div>
+
+            </div>
+
+            {/* SECURITY HEALTH */}
+
+            <div
+              className="panel"
+              style={{
+                padding:
+                  "24px",
+              }}
+            >
+
+              <div className="panel-header">
+
+                <div>
+
+                  <h3>
+                    Security Health
+                  </h3>
+
+                  <p>
+                    Current system condition
+                  </p>
+
+                </div>
+
+                <span className="live-badge">
+                  STATUS
+                </span>
+
+              </div>
+
+              <div
+                style={{
+                  display:
+                    "grid",
+                  gap:
+                    "12px",
+                  marginTop:
+                    "18px",
+                }}
+              >
+
+                <div
+                  style={{
+                    display:
+                      "flex",
+                    justifyContent:
+                      "space-between",
+                    alignItems:
+                      "center",
+                    padding:
+                      "14px",
+                    borderRadius:
+                      "10px",
+                    background:
+                      "rgba(255,255,255,0.025)",
+                    border:
+                      "1px solid rgba(89,190,255,0.07)",
+                  }}
+                >
+
+                  <span
+                    style={{
+                      color:
+                        "var(--muted)",
+                      fontSize:
+                        "11px",
+                    }}
+                  >
+                    Monitoring Sensor
+                  </span>
+
+                  <strong
+                    style={{
+                      color:
+                        monitoring
+                          ? "#4ade80"
+                          : "#f59e0b",
+                      fontSize:
+                        "12px",
+                    }}
+                  >
+                    {monitoring
+                      ? "Online"
+                      : "Offline"}
+                  </strong>
+
+                </div>
+
+                <div
+                  style={{
+                    display:
+                      "flex",
+                    justifyContent:
+                      "space-between",
+                    alignItems:
+                      "center",
+                    padding:
+                      "14px",
+                    borderRadius:
+                      "10px",
+                    background:
+                      "rgba(255,255,255,0.025)",
+                    border:
+                      "1px solid rgba(89,190,255,0.07)",
+                  }}
+                >
+
+                  <span
+                    style={{
+                      color:
+                        "var(--muted)",
+                      fontSize:
+                        "11px",
+                    }}
+                  >
+                    API Connection
+                  </span>
+
+                  <strong
+                    style={{
+                      color:
+                        "#4ade80",
+                      fontSize:
+                        "12px",
+                    }}
+                  >
+                    Connected
+                  </strong>
+
+                </div>
+
+                <div
+                  style={{
+                    display:
+                      "flex",
+                    justifyContent:
+                      "space-between",
+                    alignItems:
+                      "center",
+                    padding:
+                      "14px",
+                    borderRadius:
+                      "10px",
+                    background:
+                      "rgba(255,255,255,0.025)",
+                    border:
+                      "1px solid rgba(89,190,255,0.07)",
+                  }}
+                >
+
+                  <span
+                    style={{
+                      color:
+                        "var(--muted)",
+                      fontSize:
+                        "11px",
+                    }}
+                  >
+                    Current Risk
+                  </span>
+
+                  <strong
+                    style={{
+                      color:
+                        healthGood
+                          ? "#4ade80"
+                          : "#f59e0b",
+                      fontSize:
+                        "12px",
+                    }}
+                  >
+                    {riskLevel}{" "}
+                    ({riskScore})
+                  </strong>
+
+                </div>
+
+                <div
+                  style={{
+                    display:
+                      "flex",
+                    justifyContent:
+                      "space-between",
+                    alignItems:
+                      "center",
+                    padding:
+                      "14px",
+                    borderRadius:
+                      "10px",
+                    background:
+                      "rgba(255,255,255,0.025)",
+                    border:
+                      "1px solid rgba(89,190,255,0.07)",
+                  }}
+                >
+
+                  <span
+                    style={{
+                      color:
+                        "var(--muted)",
+                      fontSize:
+                        "11px",
+                    }}
+                  >
+                    Active Alerts
+                  </span>
+
+                  <strong
+                    style={{
+                      color:
+                        activeAlerts.length ===
+                        0
+                          ? "#4ade80"
+                          : "#ef4444",
+                      fontSize:
+                        "12px",
+                    }}
+                  >
+                    {activeAlerts.length}
+                  </strong>
+
+                </div>
+
+              </div>
+
+            </div>
+
+          </div>
+
+          {/* =========================================
+              SENSOR SUMMARY
+          ========================================= */}
+
+          <div
+            className="panel"
+            style={{
+              marginTop:
+                "18px",
+              padding:
+                "24px",
+            }}
+          >
+
+            <div className="panel-header">
+
+              <div>
+
+                <h3>
+                  Sensor Summary
+                </h3>
+
+                <p>
+                  Overview of the current
+                  network monitoring state
+                </p>
+
+              </div>
+
+              <span className="live-badge">
+                SENSOR
+              </span>
+
+            </div>
+
+            <div
+              style={{
+                display:
+                  "grid",
+                gridTemplateColumns:
+                  "repeat(4, minmax(0, 1fr))",
+                gap:
+                  "14px",
+                marginTop:
+                  "18px",
+              }}
+            >
+
+              <div
+                style={{
+                  padding:
+                    "18px",
+                  borderRadius:
+                    "12px",
+                  background:
+                    "rgba(99,102,241,0.05)",
+                  border:
+                    "1px solid rgba(99,102,241,0.12)",
+                }}
+              >
+
+                <span
+                  style={{
+                    display:
+                      "block",
+                    color:
+                      "var(--muted)",
+                    fontSize:
+                      "10px",
+                    marginBottom:
+                      "8px",
+                  }}
+                >
+                  Risk Score
+                </span>
+
+                <strong
+                  style={{
+                    fontSize:
+                      "22px",
+                  }}
+                >
+                  {riskScore}
+                  <small
+                    style={{
+                      fontSize:
+                        "11px",
+                      color:
+                        "var(--muted)",
+                      marginLeft:
+                        "4px",
+                    }}
+                  >
+                    /100
+                  </small>
+                </strong>
+
+              </div>
+
+              <div
+                style={{
+                  padding:
+                    "18px",
+                  borderRadius:
+                    "12px",
+                  background:
+                    "rgba(6,182,212,0.05)",
+                  border:
+                    "1px solid rgba(6,182,212,0.12)",
+                }}
+              >
+
+                <span
+                  style={{
+                    display:
+                      "block",
+                    color:
+                      "var(--muted)",
+                    fontSize:
+                      "10px",
+                    marginBottom:
+                      "8px",
+                  }}
+                >
+                  Protocols
+                </span>
+
+                <strong
+                  style={{
+                    fontSize:
+                      "22px",
+                  }}
+                >
+                  3
+                </strong>
+
+              </div>
+
+              <div
+                style={{
+                  padding:
+                    "18px",
+                  borderRadius:
+                    "12px",
+                  background:
+                    "rgba(239,68,68,0.05)",
+                  border:
+                    "1px solid rgba(239,68,68,0.12)",
+                }}
+              >
+
+                <span
+                  style={{
+                    display:
+                      "block",
+                    color:
+                      "var(--muted)",
+                    fontSize:
+                      "10px",
+                    marginBottom:
+                      "8px",
+                  }}
+                >
+                  Active Alerts
+                </span>
+
+                <strong
+                  style={{
+                    fontSize:
+                      "22px",
+                  }}
+                >
+                  {activeAlerts.length}
+                </strong>
+
+              </div>
+
+              <div
+                style={{
+                  padding:
+                    "18px",
+                  borderRadius:
+                    "12px",
+                  background:
+                    "rgba(34,197,94,0.05)",
+                  border:
+                    "1px solid rgba(34,197,94,0.12)",
+                }}
+              >
+
+                <span
+                  style={{
+                    display:
+                      "block",
+                    color:
+                      "var(--muted)",
+                    fontSize:
+                      "10px",
+                    marginBottom:
+                      "8px",
+                  }}
+                >
+                  Monitoring
+                </span>
+
+                <strong
+                  style={{
+                    fontSize:
+                      "22px",
+                  }}
+                >
+                  {monitoring
+                    ? "ON"
+                    : "OFF"}
+                </strong>
+
+              </div>
+
+            </div>
+
+          </div>
+
         </SimplePage>
       );
     }
 
-    /* -------------------------------------------------------
-       ALERTS
-    ------------------------------------------------------- */
+    // =================================================
+    // ATTACK DETECTION
+    // =================================================
+
+    if (page === "attacks") {
+      return (
+        <SimplePage
+          title="Attack Detection"
+          description="Scan the network for potential attacks."
+          onBack={() =>
+            setPage("dashboard")
+          }
+        >
+
+          {message && (
+            <div className="toast-message">
+              {message}
+            </div>
+          )}
+
+          <div className="action-card">
+
+            <div>
+
+              <h3>
+                Network Attack Scanner
+              </h3>
+
+              <p>
+                Run a security scan to
+                detect suspicious network
+                activity.
+              </p>
+
+            </div>
+
+            <button
+              className="primary-btn"
+              onClick={runScan}
+              disabled={loading}
+            >
+              {loading
+                ? "Scanning..."
+                : "Run Attack Scan"}
+            </button>
+
+          </div>
+
+          {scanResults.length > 0 && (
+            <div className="panel">
+
+              <div className="panel-header">
+
+                <div>
+
+                  <h3>
+                    Latest Detected Threats
+                  </h3>
+
+                  <p>
+                    Results from the latest
+                    network scans
+                  </p>
+
+                </div>
+
+                <span className="live-badge">
+                  DETECTION
+                </span>
+
+              </div>
+
+              <div className="table-wrapper">
+
+                <table>
+
+                  <thead>
+
+                    <tr>
+                      <th>
+                        Attack
+                      </th>
+
+                      <th>
+                        Source
+                      </th>
+
+                      <th>
+                        Destination
+                      </th>
+
+                      <th>
+                        Severity
+                      </th>
+
+                      <th>
+                        Confidence
+                      </th>
+
+                      <th>
+                        Status
+                      </th>
+                    </tr>
+
+                  </thead>
+
+                  <tbody>
+
+                    {scanResults.map(
+                      (item, index) => (
+                        <tr
+                          key={
+                            item._id ||
+                            index
+                          }
+                        >
+
+                          <td>
+                            {item.attackType ||
+                              item.type}
+                          </td>
+
+                          <td>
+                            {item.sourceIP ||
+                              item.source}
+                          </td>
+
+                          <td>
+                            {item.targetIP ||
+                              item.destination}
+                          </td>
+
+                          <td>
+
+                            <span
+                              className={`severity ${
+                                item.severity?.toLowerCase() ||
+                                "medium"
+                              }`}
+                            >
+                              {item.severity}
+                            </span>
+
+                          </td>
+
+                          <td>
+                            {item.confidence}%
+                          </td>
+
+                          <td>
+                            {item.status ||
+                              "Detected"}
+                          </td>
+
+                        </tr>
+                      )
+                    )}
+
+                  </tbody>
+
+                </table>
+
+              </div>
+
+            </div>
+          )}
+
+        </SimplePage>
+      );
+    }
+
+    // =================================================
+    // TRAFFIC ANALYSIS
+    // =================================================
+
+    if (page === "traffic") {
+      return (
+        <SimplePage
+          title="Traffic Analysis"
+          description="Analyze network packet distribution and protocols."
+          onBack={() =>
+            setPage("dashboard")
+          }
+        >
+
+          {message && (
+            <div className="toast-message">
+              {message}
+            </div>
+          )}
+
+          <div className="action-card">
+
+            <div>
+
+              <h3>
+                Traffic Analyzer
+              </h3>
+
+              <p>
+                Inspect incoming,
+                outgoing and suspicious
+                network traffic.
+              </p>
+
+            </div>
+
+            <button
+              className="primary-btn"
+              onClick={analyzeTraffic}
+              disabled={loading}
+            >
+              {loading
+                ? "Analyzing..."
+                : "Analyze Traffic"}
+            </button>
+
+          </div>
+
+          <div className="chart-grid">
+
+            <div className="panel">
+
+              <div className="panel-header">
+
+                <div>
+
+                  <h3>
+                    Protocol Distribution
+                  </h3>
+
+                  <p>
+                    TCP, UDP and ICMP
+                    traffic
+                  </p>
+
+                </div>
+
+              </div>
+
+              <ResponsiveContainer
+                width="100%"
+                height={330}
+              >
+
+                <PieChart>
+
+                  <Pie
+                    data={
+                      protocolData
+                    }
+                    dataKey="value"
+                    nameKey="name"
+                    innerRadius={65}
+                    outerRadius={110}
+                    paddingAngle={5}
+                  >
+
+                    {protocolData.map(
+                      (item, index) => (
+                        <Cell
+                          key={
+                            item.name
+                          }
+                          fill={
+                            COLORS[index]
+                          }
+                        />
+                      )
+                    )}
+
+                  </Pie>
+
+                  <Tooltip />
+
+                  <Legend />
+
+                </PieChart>
+
+              </ResponsiveContainer>
+
+            </div>
+
+            <div className="panel">
+
+              <div className="panel-header">
+
+                <div>
+
+                  <h3>
+                    Traffic Volume
+                  </h3>
+
+                  <p>
+                    Current traffic
+                    distribution
+                  </p>
+
+                </div>
+
+              </div>
+
+              <ResponsiveContainer
+                width="100%"
+                height={330}
+              >
+
+                <BarChart
+                  data={
+                    trafficData
+                  }
+                >
+
+                  <CartesianGrid
+                    strokeDasharray="3 3"
+                  />
+
+                  <XAxis
+                    dataKey="name"
+                  />
+
+                  <YAxis />
+
+                  <Tooltip />
+
+                  <Bar
+                    dataKey="value"
+                    fill="#06b6d4"
+                    radius={[
+                      8,
+                      8,
+                      0,
+                      0,
+                    ]}
+                  />
+
+                </BarChart>
+
+              </ResponsiveContainer>
+
+            </div>
+
+          </div>
+
+          {traffic && (
+            <div
+              className="stat-grid"
+              style={{
+                marginTop:
+                  "18px",
+              }}
+            >
+
+              <div className="stat-card blue">
+
+                <div className="stat-icon">
+                  ↓
+                </div>
+
+                <div>
+
+                  <span>
+                    Incoming
+                  </span>
+
+                  <strong>
+                    {traffic.incoming}
+                  </strong>
+
+                  <small>
+                    Traffic units
+                  </small>
+
+                </div>
+
+              </div>
+
+              <div className="stat-card purple">
+
+                <div className="stat-icon">
+                  ↑
+                </div>
+
+                <div>
+
+                  <span>
+                    Outgoing
+                  </span>
+
+                  <strong>
+                    {traffic.outgoing}
+                  </strong>
+
+                  <small>
+                    Traffic units
+                  </small>
+
+                </div>
+
+              </div>
+
+              <div className="stat-card red">
+
+                <div className="stat-icon">
+                  ⚠
+                </div>
+
+                <div>
+
+                  <span>
+                    Suspicious
+                  </span>
+
+                  <strong>
+                    {traffic.suspicious}
+                  </strong>
+
+                  <small>
+                    Requires monitoring
+                  </small>
+
+                </div>
+
+              </div>
+
+            </div>
+          )}
+
+        </SimplePage>
+      );
+    }
+
+    // =================================================
+    // THREAT INTELLIGENCE
+    // =================================================
+
+    if (page === "intel") {
+      return (
+        <SimplePage
+          title="Threat Intelligence"
+          description="Investigate an IP address or domain."
+          onBack={() =>
+            setPage("dashboard")
+          }
+        >
+
+          {message && (
+            <div className="toast-message">
+              {message}
+            </div>
+          )}
+
+          <div
+            className="panel"
+            style={{
+              padding:
+                "26px",
+            }}
+          >
+
+            <div className="panel-header">
+
+              <div>
+
+                <h3>
+                  Threat Investigation
+                </h3>
+
+                <p>
+                  Enter an IP address or
+                  domain for security
+                  analysis.
+                </p>
+
+              </div>
+
+            </div>
+
+            <div
+              className="intel-box"
+              style={{
+                marginTop:
+                  "20px",
+              }}
+            >
+
+              <input
+                value={target}
+                onChange={(e) =>
+                  setTarget(
+                    e.target.value
+                  )
+                }
+                placeholder="Enter IP address or domain"
+              />
+
+              <button
+                className="primary-btn"
+                onClick={threatIntel}
+                disabled={loading}
+              >
+                {loading
+                  ? "Investigating..."
+                  : "Investigate"}
+              </button>
+
+            </div>
+
+          </div>
+
+          {intelResult && (
+            <div
+              className="intel-result"
+              style={{
+                marginTop:
+                  "18px",
+              }}
+            >
+
+              <div className="risk-score">
+
+                <strong>
+                  {intelResult.riskScore}
+                </strong>
+
+                <span>
+                  Risk Score
+                </span>
+
+              </div>
+
+              <div>
+
+                <span>
+                  Reputation
+                </span>
+
+                <strong>
+                  {
+                    intelResult.reputation
+                  }
+                </strong>
+
+              </div>
+
+              <div>
+
+                <span>
+                  Category
+                </span>
+
+                <strong>
+                  {
+                    intelResult.category
+                  }
+                </strong>
+
+              </div>
+
+              <div>
+
+                <span>
+                  Reports
+                </span>
+
+                <strong>
+                  {
+                    intelResult.reports
+                  }
+                </strong>
+
+              </div>
+
+            </div>
+          )}
+
+        </SimplePage>
+      );
+    }
+
+    // =================================================
+    // ALERTS
+    // =================================================
 
     if (page === "alerts") {
       return (
         <SimplePage
           title="Security Alerts"
           description="Review and resolve detected security alerts."
+          onBack={() =>
+            setPage("dashboard")
+          }
         >
+
+          {message && (
+            <div className="toast-message">
+              {message}
+            </div>
+          )}
+
           <div className="panel">
+
+            <div className="panel-header">
+
+              <div>
+
+                <h3>
+                  Security Alert Center
+                </h3>
+
+                <p>
+                  Review active and
+                  resolved security events.
+                </p>
+
+              </div>
+
+              <span className="live-badge">
+                {activeAlerts.length} ACTIVE
+              </span>
+
+            </div>
+
             <div className="alert-list">
+
               {alerts.length === 0 ? (
                 <div className="empty-state">
-                  No security alerts
+                  No security alerts found.
                 </div>
               ) : (
-                alerts.map((alert) => (
-                  <div
-                    className="alert-row full"
-                    key={alert.id}
-                  >
-                    <div className="alert-icon">
-                      !
-                    </div>
-
-                    <div className="alert-main">
-                      <strong>
-                        {alert.type}
-                      </strong>
-
-                      <span>
-                        Source: {alert.source}
-                      </span>
-                    </div>
-
-                    <span
-                      className={`severity ${alert.severity.toLowerCase()}`}
-                    >
-                      {alert.severity}
-                    </span>
-
-                    <span
-                      className={
-                        alert.status ===
-                        "Resolved"
-                          ? "resolved"
-                          : "active-status"
+                alerts.map(
+                  (alert) => (
+                    <div
+                      className="alert-row full"
+                      key={
+                        alert._id ||
+                        alert.id
                       }
                     >
-                      {alert.status}
-                    </span>
 
-                    {alert.status ===
-                      "Active" && (
-                      <button
-                        className="resolve-btn"
-                        onClick={() =>
-                          resolveAlert(
-                            alert.id
-                          )
+                      <div className="alert-icon">
+                        !
+                      </div>
+
+                      <div className="alert-main">
+
+                        <strong>
+                          {alert.type ||
+                            alert.title}
+                        </strong>
+
+                        <span>
+                          Source:{" "}
+                          {alert.source}
+                        </span>
+
+                        {alert.description && (
+                          <small
+                            style={{
+                              marginTop:
+                                "4px",
+                            }}
+                          >
+                            {
+                              alert.description
+                            }
+                          </small>
+                        )}
+
+                      </div>
+
+                      <span
+                        className={`severity ${
+                          alert.severity?.toLowerCase() ||
+                          "medium"
+                        }`}
+                      >
+                        {alert.severity}
+                      </span>
+
+                      <span
+                        className={
+                          alert.status ===
+                          "Resolved"
+                            ? "resolved"
+                            : "active-status"
                         }
                       >
-                        Resolve
-                      </button>
-                    )}
-                  </div>
-                ))
+                        {alert.status}
+                      </span>
+
+                      {alert.status ===
+                        "Active" && (
+                        <button
+                          className="resolve-btn"
+                          onClick={() =>
+                            resolveAlert(
+                              alert._id ||
+                                alert.id
+                            )
+                          }
+                        >
+                          Resolve
+                        </button>
+                      )}
+
+                    </div>
+                  )
+                )
               )}
+
             </div>
+
           </div>
+
         </SimplePage>
       );
     }
 
-    /* -------------------------------------------------------
-       REPORTS
-    ------------------------------------------------------- */
+    // =================================================
+    // REPORTS
+    // =================================================
 
     if (page === "reports") {
       return (
         <SimplePage
           title="Security Reports"
-          description="Generate a security activity report."
+          description="Generate and review network security reports."
+          onBack={() =>
+            setPage("dashboard")
+          }
         >
+
+          {message && (
+            <div className="toast-message">
+              {message}
+            </div>
+          )}
+
           <div className="action-card">
+
             <div>
-              <h3>Security Report</h3>
+
+              <h3>
+                Network Security Report
+              </h3>
 
               <p>
-                Generate the latest network
-                security summary.
+                Generate a current
+                security summary from
+                the backend.
               </p>
+
             </div>
 
             <button
               className="primary-btn"
               onClick={generateReport}
+              disabled={loading}
             >
-              Generate Report
+              {loading
+                ? "Generating..."
+                : "Generate Report"}
             </button>
+
           </div>
 
           {report && (
-            <div className="report-card">
-              <div>
-                <span>Report ID</span>
-
-                <strong>
-                  {report.id}
-                </strong>
-              </div>
-
-              <div>
-                <span>Generated</span>
-
-                <strong>
-                  {report.generatedAt}
-                </strong>
-              </div>
-
-              <div>
-                <span>Threats</span>
-
-                <strong>
-                  {report.threats}
-                </strong>
-              </div>
-
-              <div>
-                <span>Blocked</span>
-
-                <strong>
-                  {report.blocked}
-                </strong>
-              </div>
-
-              <div>
-                <span>Packets</span>
-
-                <strong>
-                  {report.packets.toLocaleString()}
-                </strong>
-              </div>
-            </div>
-          )}
-        </SimplePage>
-      );
-    }
-
-    /* -------------------------------------------------------
-       SETTINGS
-    ------------------------------------------------------- */
-
-    if (page === "settings") {
-      return (
-        <SimplePage
-          title="Security Control Center"
-          description="Configure monitoring, detection and platform security preferences."
-        >
-          {settingsSaved && (
-            <div className="settings-success">
-              <span className="success-icon">
-                ✓
-              </span>
-
-              <div>
-                <strong>
-                  Security configuration saved
-                </strong>
-
-                <p>
-                  Your network security
-                  preferences are now active.
-                </p>
-              </div>
-            </div>
-          )}
-
-          {/* SECURITY STATUS */}
-
-          <div className="security-status-card">
-            <div className="security-status-left">
-              <div className="shield-pulse">
-                🛡
-              </div>
-
-              <div>
-                <span className="settings-eyebrow">
-                  SYSTEM SECURITY
-                </span>
-
-                <h3>
-                  {highSecurity
-                    ? "Maximum Protection Enabled"
-                    : "Standard Protection Mode"}
-                </h3>
-
-                <p>
-                  Your security engine is
-                  configured for{" "}
-                  {highSecurity
-                    ? "enhanced threat detection and aggressive monitoring."
-                    : "standard network monitoring."}
-                </p>
-              </div>
-            </div>
-
-            <div className="security-score">
-              <div className="score-circle">
-                <strong>
-                  {highSecurity ? "98" : "82"}
-                </strong>
-
-                <span>SECURITY</span>
-              </div>
-            </div>
-          </div>
-
-          {/* SETTINGS GRID */}
-
-          <div className="settings-layout">
-            <div className="settings-column">
-
-              {/* NETWORK MONITORING */}
-
-              <div className="settings-panel">
-                <div className="settings-panel-title">
-                  <div className="settings-title-icon blue">
-                    ◉
-                  </div>
-
-                  <div>
-                    <h3>
-                      Network Monitoring
-                    </h3>
-
-                    <p>
-                      Control real-time network
-                      surveillance.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="settings-option">
-                  <div>
-                    <strong>
-                      Live Monitoring
-                    </strong>
-
-                    <span>
-                      Continuously monitor network
-                      activity and suspicious
-                      connections.
-                    </span>
-                  </div>
-
-                  <button
-                    className={
-                      monitoring
-                        ? "toggle active"
-                        : "toggle"
-                    }
-                    onClick={
-                      toggleMonitoring
-                    }
-                  >
-                    <span />
-                  </button>
-                </div>
-
-                <div className="settings-option">
-                  <div>
-                    <strong>
-                      Automatic Refresh
-                    </strong>
-
-                    <span>
-                      Automatically refresh security
-                      statistics.
-                    </span>
-                  </div>
-
-                  <button
-                    className={
-                      autoRefresh
-                        ? "toggle active"
-                        : "toggle"
-                    }
-                    onClick={() =>
-                      setAutoRefresh(
-                        !autoRefresh
-                      )
-                    }
-                  >
-                    <span />
-                  </button>
-                </div>
-
-                <div className="settings-option">
-                  <div>
-                    <strong>
-                      Scan Interval
-                    </strong>
-
-                    <span>
-                      Frequency of automated threat
-                      scans.
-                    </span>
-                  </div>
-
-                  <select
-                    className="settings-select"
-                    value={scanInterval}
-                    onChange={(e) =>
-                      setScanInterval(
-                        e.target.value
-                      )
-                    }
-                  >
-                    <option value="15">
-                      15 seconds
-                    </option>
-
-                    <option value="30">
-                      30 seconds
-                    </option>
-
-                    <option value="60">
-                      1 minute
-                    </option>
-
-                    <option value="300">
-                      5 minutes
-                    </option>
-                  </select>
-                </div>
-              </div>
-
-              {/* THREAT DETECTION */}
-
-              <div className="settings-panel">
-                <div className="settings-panel-title">
-                  <div className="settings-title-icon red">
-                    ⚡
-                  </div>
-
-                  <div>
-                    <h3>
-                      Threat Detection
-                    </h3>
-
-                    <p>
-                      Configure attack detection
-                      behavior.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="settings-option">
-                  <div>
-                    <strong>
-                      Enhanced Detection
-                    </strong>
-
-                    <span>
-                      Enable aggressive threat
-                      identification.
-                    </span>
-                  </div>
-
-                  <button
-                    className={
-                      highSecurity
-                        ? "toggle active"
-                        : "toggle"
-                    }
-                    onClick={() =>
-                      setHighSecurity(
-                        !highSecurity
-                      )
-                    }
-                  >
-                    <span />
-                  </button>
-                </div>
-
-                <div className="detection-level">
-                  <div className="level-header">
-                    <strong>
-                      Detection Sensitivity
-                    </strong>
-
-                    <span>
-                      {highSecurity
-                        ? "HIGH"
-                        : "STANDARD"}
-                    </span>
-                  </div>
-
-                  <div className="level-bar">
-                    <div
-                      className={
-                        highSecurity
-                          ? "level-fill high"
-                          : "level-fill standard"
-                      }
-                    />
-                  </div>
-
-                  <div className="level-labels">
-                    <span>Low</span>
-                    <span>
-                      Standard
-                    </span>
-                    <span>High</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* RIGHT COLUMN */}
-
-            <div className="settings-column">
-
-              {/* ALERT MANAGEMENT */}
-
-              <div className="settings-panel">
-                <div className="settings-panel-title">
-                  <div className="settings-title-icon yellow">
-                    !
-                  </div>
-
-                  <div>
-                    <h3>
-                      Alert Management
-                    </h3>
-
-                    <p>
-                      Configure security
-                      notifications.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="settings-option">
-                  <div>
-                    <strong>
-                      Security Notifications
-                    </strong>
-
-                    <span>
-                      Receive notifications for
-                      detected threats.
-                    </span>
-                  </div>
-
-                  <button
-                    className={
-                      notifications
-                        ? "toggle active"
-                        : "toggle"
-                    }
-                    onClick={() =>
-                      setNotifications(
-                        !notifications
-                      )
-                    }
-                  >
-                    <span />
-                  </button>
-                </div>
-
-                <div className="notification-preview">
-                  <div className="notification-icon">
-                    ⚠
-                  </div>
-
-                  <div>
-                    <strong>
-                      Threat Alert
-                    </strong>
-
-                    <span>
-                      High severity network
-                      activity detected.
-                    </span>
-                  </div>
-
-                  <small>LIVE</small>
-                </div>
-              </div>
-
-              {/* ACCESS SECURITY */}
-
-              <div className="settings-panel">
-                <div className="settings-panel-title">
-                  <div className="settings-title-icon purple">
-                    ◈
-                  </div>
-
-                  <div>
-                    <h3>
-                      Access Security
-                    </h3>
-
-                    <p>
-                      Protect your security
-                      platform account.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="settings-option">
-                  <div>
-                    <strong>
-                      Two-Factor Authentication
-                    </strong>
-
-                    <span>
-                      Add an additional layer of
-                      account protection.
-                    </span>
-                  </div>
-
-                  <button
-                    className={
-                      twoFactor
-                        ? "toggle active"
-                        : "toggle"
-                    }
-                    onClick={() =>
-                      setTwoFactor(
-                        !twoFactor
-                      )
-                    }
-                  >
-                    <span />
-                  </button>
-                </div>
-
-                <div className="access-status">
-                  <div className="access-status-icon">
-                    ✓
-                  </div>
-
-                  <div>
-                    <strong>
-                      API Connection
-                    </strong>
-
-                    <span>
-                      Backend security service
-                      connected
-                    </span>
-                  </div>
-
-                  <b>ONLINE</b>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* SYSTEM INFORMATION */}
-
-          <div className="system-info-panel">
-            <div className="system-info-header">
-              <div>
-                <span className="settings-eyebrow">
-                  SYSTEM INFORMATION
-                </span>
-
-                <h3>
-                  Network Security Environment
-                </h3>
-              </div>
-
-              <span className="system-online">
-                ● SYSTEM ONLINE
-              </span>
-            </div>
-
-            <div className="system-info-grid">
-              <div>
-                <span>
-                  Security Engine
-                </span>
-
-                <strong>Active</strong>
-              </div>
-
-              <div>
-                <span>
-                  Threat Database
-                </span>
-
-                <strong>
-                  Up to date
-                </strong>
-              </div>
-
-              <div>
-                <span>
-                  Monitoring Mode
-                </span>
-
-                <strong>
-                  {monitoring
-                    ? "Live"
-                    : "Standby"}
-                </strong>
-              </div>
-
-              <div>
-                <span>
-                  Scan Frequency
-                </span>
-
-                <strong>
-                  {scanInterval}s
-                </strong>
-              </div>
-            </div>
-          </div>
-
-          {/* ACTION BUTTONS */}
-
-          <div className="settings-actions">
-            <button
-              className="secondary-btn"
-              onClick={() => {
-                setAutoRefresh(true);
-                setNotifications(true);
-                setHighSecurity(true);
-                setTwoFactor(false);
-                setScanInterval("30");
+            <div
+              className="report-card"
+              style={{
+                marginTop:
+                  "18px",
               }}
             >
-              Reset Defaults
-            </button>
 
-            <button
-              className="primary-btn settings-save-btn"
-              onClick={
-                saveSecuritySettings
-              }
-            >
-              ✓ Save Security Configuration
-            </button>
-          </div>
+              <div>
+
+                <span>
+                  Report ID
+                </span>
+
+                <strong>
+                  {report._id ||
+                    report.id ||
+                    "Generated"}
+                </strong>
+
+              </div>
+
+              <div>
+
+                <span>
+                  Generated
+                </span>
+
+                <strong>
+                  {report.createdAt
+                    ? new Date(
+                        report.createdAt
+                      ).toLocaleString()
+                    : "Just now"}
+                </strong>
+
+              </div>
+
+              <div>
+
+                <span>
+                  Threats
+                </span>
+
+                <strong>
+                  {report.threats ??
+                    0}
+                </strong>
+
+              </div>
+
+              <div>
+
+                <span>
+                  Blocked
+                </span>
+
+                <strong>
+                  {report.blocked ??
+                    0}
+                </strong>
+
+              </div>
+
+              <div>
+
+                <span>
+                  Active Alerts
+                </span>
+
+                <strong>
+                  {report.alerts ??
+                    0}
+                </strong>
+
+              </div>
+
+              <div>
+
+                <span>
+                  Risk Score
+                </span>
+
+                <strong>
+                  {report.riskScore ??
+                    0}
+                </strong>
+
+              </div>
+
+            </div>
+          )}
+
         </SimplePage>
       );
     }
 
-    return <Dashboard />;
+    // =================================================
+    // SETTINGS
+    // =================================================
+
+    return (
+      <SimplePage
+        title="Settings"
+        description="Manage security platform preferences."
+        onBack={() =>
+          setPage("dashboard")
+        }
+      >
+
+        {message && (
+          <div className="toast-message">
+            {message}
+          </div>
+        )}
+
+        <div className="settings-grid">
+
+          <div className="setting-card">
+
+            <span>
+              Monitoring Status
+            </span>
+
+            <strong>
+              {monitoring
+                ? "Active"
+                : "Inactive"}
+            </strong>
+
+          </div>
+
+          <div className="setting-card">
+
+            <span>
+              API Status
+            </span>
+
+            <strong>
+              Connected
+            </strong>
+
+          </div>
+
+          <div className="setting-card">
+
+            <span>
+              Database
+            </span>
+
+            <strong>
+              MongoDB
+            </strong>
+
+          </div>
+
+          <div className="setting-card">
+
+            <span>
+              Security Mode
+            </span>
+
+            <strong>
+              Protected
+            </strong>
+
+          </div>
+
+        </div>
+
+        <div
+          className="panel"
+          style={{
+            marginTop:
+              "18px",
+            padding:
+              "24px",
+          }}
+        >
+
+          <div className="panel-header">
+
+            <div>
+
+              <h3>
+                System Information
+              </h3>
+
+              <p>
+                Current Network Attack
+                platform configuration.
+              </p>
+
+            </div>
+
+          </div>
+
+          <div
+            style={{
+              display:
+                "grid",
+              gridTemplateColumns:
+                "repeat(2, minmax(0, 1fr))",
+              gap:
+                "12px",
+              marginTop:
+                "18px",
+            }}
+          >
+
+            <div
+              style={{
+                padding:
+                  "16px",
+                borderRadius:
+                  "10px",
+                background:
+                  "rgba(255,255,255,0.025)",
+                border:
+                  "1px solid rgba(89,190,255,0.07)",
+              }}
+            >
+
+              <span
+                style={{
+                  color:
+                    "var(--muted)",
+                  fontSize:
+                    "10px",
+                }}
+              >
+                Backend
+              </span>
+
+              <strong
+                style={{
+                  display:
+                    "block",
+                  marginTop:
+                    "6px",
+                }}
+              >
+                Express.js
+              </strong>
+
+            </div>
+
+            <div
+              style={{
+                padding:
+                  "16px",
+                borderRadius:
+                  "10px",
+                background:
+                  "rgba(255,255,255,0.025)",
+                border:
+                  "1px solid rgba(89,190,255,0.07)",
+              }}
+            >
+
+              <span
+                style={{
+                  color:
+                    "var(--muted)",
+                  fontSize:
+                    "10px",
+                }}
+              >
+                Database
+              </span>
+
+              <strong
+                style={{
+                  display:
+                    "block",
+                  marginTop:
+                    "6px",
+                }}
+              >
+                MongoDB
+              </strong>
+
+            </div>
+
+            <div
+              style={{
+                padding:
+                  "16px",
+                borderRadius:
+                  "10px",
+                background:
+                  "rgba(255,255,255,0.025)",
+                border:
+                  "1px solid rgba(89,190,255,0.07)",
+              }}
+            >
+
+              <span
+                style={{
+                  color:
+                    "var(--muted)",
+                  fontSize:
+                    "10px",
+                }}
+              >
+                Security API
+              </span>
+
+              <strong
+                style={{
+                  display:
+                    "block",
+                  marginTop:
+                    "6px",
+                }}
+              >
+                Online
+              </strong>
+
+            </div>
+
+            <div
+              style={{
+                padding:
+                  "16px",
+                borderRadius:
+                  "10px",
+                background:
+                  "rgba(255,255,255,0.025)",
+                border:
+                  "1px solid rgba(89,190,255,0.07)",
+              }}
+            >
+
+              <span
+                style={{
+                  color:
+                    "var(--muted)",
+                  fontSize:
+                    "10px",
+                }}
+              >
+                Monitoring Refresh
+              </span>
+
+              <strong
+                style={{
+                  display:
+                    "block",
+                  marginTop:
+                    "6px",
+                }}
+              >
+                5 seconds
+              </strong>
+
+            </div>
+
+          </div>
+
+        </div>
+
+      </SimplePage>
+    );
   };
 
-  /* =========================================================
-     MAIN APP
-  ========================================================= */
+  // ===================================================
+  // FINAL APP LAYOUT
+  // ===================================================
 
   return (
     <div className="app-shell">
+
       <Sidebar />
 
       <main className="main-area">
+
         <Header />
 
         <section className="content">
           {renderPage()}
         </section>
+
       </main>
+
     </div>
   );
 }
