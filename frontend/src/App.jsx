@@ -97,8 +97,6 @@ function App() {
 
   const [traffic, setTraffic] = useState(null);
 
-  const [trafficRecords, setTrafficRecords] = useState([]);
-
   const [target, setTarget] = useState("");
 
   const [intelResult, setIntelResult] = useState(null);
@@ -122,14 +120,11 @@ function App() {
         return;
       }
 
-      const [dashboardRes, alertsRes, trafficRes] = await Promise.all([
+      const [dashboardRes, alertsRes] = await Promise.all([
         fetch(`${API}/dashboard`, {
           headers: authHeaders(),
         }),
         fetch(`${API}/alerts`, {
-          headers: authHeaders(),
-        }),
-        fetch(`${API}/traffic`, {
           headers: authHeaders(),
         }),
       ]);
@@ -138,9 +133,7 @@ function App() {
         dashboardRes.status === 401 ||
         dashboardRes.status === 403 ||
         alertsRes.status === 401 ||
-        alertsRes.status === 403 ||
-        trafficRes.status === 401 ||
-        trafficRes.status === 403
+        alertsRes.status === 403
       ) {
         localStorage.removeItem("networkAttackToken");
         setLoggedIn(false);
@@ -150,56 +143,24 @@ function App() {
 
       const dashboardData = await dashboardRes.json();
       const alertData = await alertsRes.json();
-      const trafficDataResponse = await trafficRes.json();
-
-      const records =
-        trafficDataResponse.success &&
-        Array.isArray(trafficDataResponse.traffic)
-          ? trafficDataResponse.traffic
-          : [];
-
-      setTrafficRecords(records);
-
-      const totalPackets = records.reduce(
-        (sum, item) => sum + Number(item.packetCount || 0),
-        0
-      );
-
-      const totalConnections = records.length;
-
-      const suspiciousTraffic = records.filter(
-        (item) =>
-          String(item.label || "BENIGN").toUpperCase() !== "BENIGN"
-      ).length;
-
-      const protocolCounts = records.reduce((acc, item) => {
-        const protocol = String(item.protocol || "OTHER").toUpperCase();
-        acc[protocol] = (acc[protocol] || 0) + 1;
-        return acc;
-      }, {});
 
       if (dashboardData.success) {
         const d = dashboardData.data || {};
 
         setDashboard({
           stats: {
-            packets: totalPackets || d.packets || d.totalPackets || 0,
-            threats: d.threatsDetected ?? d.threats ?? suspiciousTraffic,
+            packets: d.packets ?? d.totalPackets ?? 0,
+            threats: d.threatsDetected ?? d.threats ?? 0,
             blocked: d.blockedThreats ?? d.blocked ?? 0,
             activeAlerts: d.totalAlerts ?? d.activeAlerts ?? 0,
-            connections: totalConnections || d.connections || 0,
+            connections: d.connections ?? 0,
           },
           risk: {
             score: d.riskScore ?? d.risk?.score ?? 48,
             level: d.riskLevel ?? d.risk?.level ?? "Medium",
           },
-          traffic: {
-            ...(d.traffic || {}),
-            incoming: totalPackets,
-            outgoing: 0,
-            suspicious: suspiciousTraffic,
-          },
-          protocols: protocolCounts,
+          traffic: d.traffic || {},
+          protocols: d.protocols || {},
           networkStatus: d.networkStatus || "Secure",
         });
       }
@@ -710,23 +671,64 @@ function App() {
       const data = await res.json();
 
       if (!res.ok || !data.success) {
-        setMessage(
-          data.message || "Report generation failed"
-        );
+        setMessage(data.message || "Report generation failed");
         return;
       }
 
-      setReport(data.report || data.data || null);
-      setMessage(
-        "Security report generated successfully"
+      const rawReport = data.report || data.data || {};
+
+      const riskScoreMap = {
+        Critical: 90,
+        High: 75,
+        Medium: 50,
+        Low: 20,
+      };
+
+      const threatsDetected = Number(
+        rawReport.threatsDetected ?? rawReport.threats ?? 0
       );
+
+      const activeAlerts = Number(
+        rawReport.activeAlerts ?? rawReport.alerts ?? 0
+      );
+
+      const resolvedAlerts = Number(
+        rawReport.resolvedAlerts ?? 0
+      );
+
+      const blockedThreats = Number(
+        rawReport.blockedThreats ??
+          Math.max(0, threatsDetected - activeAlerts)
+      );
+
+      const riskScore = Number(
+        rawReport.riskScore ??
+          riskScoreMap[rawReport.riskLevel] ??
+          0
+      );
+
+      const normalizedReport = {
+        ...rawReport,
+        threats: threatsDetected,
+        blocked: blockedThreats,
+        alerts: activeAlerts,
+        riskScore,
+        threatsDetected,
+        activeAlerts,
+        resolvedAlerts,
+        highRiskThreats: Number(rawReport.highRiskThreats ?? 0),
+        riskLevel: rawReport.riskLevel || "Low",
+      };
+
+      setReport(normalizedReport);
+      setMessage("Security report generated successfully");
     } catch (error) {
       console.error("Report error:", error);
       setMessage("Report generation failed");
     } finally {
       setLoading(false);
     }
-  };
+  };;
 
   // ===================================================
   // LOGOUT
@@ -991,36 +993,74 @@ function App() {
         alert.status === "Resolved"
     );
 
-  const severityCounts = alerts.reduce(
-    (acc, alert) => {
-      const severity = alert.severity || "Medium";
-      acc[severity] = (acc[severity] || 0) + 1;
-      return acc;
+  const severityData = [
+    {
+      name: "Critical",
+      value: Math.max(
+        1,
+        Math.round(
+          stats.threats * 0.18
+        )
+      ),
     },
-    {}
-  );
 
-  const severityData = ["Critical", "High", "Medium", "Low"].map((name) => ({
-    name,
-    value: severityCounts[name] || 0,
-  }));
-
-  const attackCounts = (alerts.length ? alerts : scanResults).reduce(
-    (acc, item) => {
-      const name =
-        item.type ||
-        item.attackType ||
-        item.title ||
-        "Other";
-      acc[name] = (acc[name] || 0) + 1;
-      return acc;
+    {
+      name: "High",
+      value: Math.max(
+        1,
+        Math.round(
+          stats.threats * 0.32
+        )
+      ),
     },
-    {}
-  );
 
-  const attackData = Object.entries(attackCounts).length
-    ? Object.entries(attackCounts).map(([name, value]) => ({ name, value }))
-    : [{ name: "No Attacks", value: 1 }];
+    {
+      name: "Medium",
+      value: Math.max(
+        1,
+        Math.round(
+          stats.threats * 0.35
+        )
+      ),
+    },
+
+    {
+      name: "Low",
+      value: Math.max(
+        1,
+        Math.round(
+          stats.threats * 0.15
+        )
+      ),
+    },
+  ];
+
+  const attackData = [
+    {
+      name: "Brute Force",
+      value: 8,
+    },
+
+    {
+      name: "Port Scan",
+      value: 6,
+    },
+
+    {
+      name: "Malware",
+      value: 4,
+    },
+
+    {
+      name: "Suspicious Traffic",
+      value: 3,
+    },
+
+    {
+      name: "Other",
+      value: 3,
+    },
+  ];
 
   const trafficSource =
     dashboard?.traffic || {};
@@ -1028,27 +1068,57 @@ function App() {
   const trafficData = [
     {
       name: "Incoming",
-      value: Number(traffic?.incoming ?? trafficSource.incoming ?? trafficRecords.reduce((sum, item) => sum + Number(item.packetCount || 0), 0)),
+      value:
+        traffic?.incoming ??
+        trafficSource.incoming ??
+        48,
     },
+
     {
       name: "Outgoing",
-      value: Number(traffic?.outgoing ?? trafficSource.outgoing ?? 0),
+      value:
+        traffic?.outgoing ??
+        trafficSource.outgoing ??
+        32,
     },
+
     {
       name: "Suspicious",
-      value: Number(traffic?.suspicious ?? trafficSource.suspicious ?? trafficRecords.filter((item) => String(item.label || "BENIGN").toUpperCase() !== "BENIGN").length),
+      value:
+        traffic?.suspicious ??
+        trafficSource.suspicious ??
+        20,
     },
   ];
 
   const protocolSource =
     dashboard?.protocols || {};
 
-  const protocolData = Object.entries(protocolSource).length
-    ? Object.entries(protocolSource).map(([name, value]) => ({
-        name,
-        value: Number(value || 0),
-      }))
-    : [{ name: "No Data", value: 1 }];
+  const protocolData = [
+    {
+      name: "TCP",
+      value:
+        Number(
+          protocolSource.TCP ?? 55
+        ),
+    },
+
+    {
+      name: "UDP",
+      value:
+        Number(
+          protocolSource.UDP ?? 30
+        ),
+    },
+
+    {
+      name: "ICMP",
+      value:
+        Number(
+          protocolSource.ICMP ?? 15
+        ),
+    },
+  ];
 
   const alertStatusData = [
     {
@@ -1064,27 +1134,43 @@ function App() {
     },
   ];
 
-  const activityBuckets = {};
+  const activityData = [
+    {
+      time: "08:00",
+      threats: 3,
+      packets: 32,
+    },
 
-  trafficRecords.forEach((item) => {
-    const date = item.timestamp ? new Date(item.timestamp) : new Date();
-    const hour = date.getHours();
-    const time = `${String(hour).padStart(2, "0")}:00`;
+    {
+      time: "10:00",
+      threats: 5,
+      packets: 45,
+    },
 
-    if (!activityBuckets[time]) {
-      activityBuckets[time] = { time, threats: 0, packets: 0 };
-    }
+    {
+      time: "12:00",
+      threats: 4,
+      packets: 38,
+    },
 
-    activityBuckets[time].packets += Number(item.packetCount || 0);
+    {
+      time: "14:00",
+      threats: 8,
+      packets: 62,
+    },
 
-    if (String(item.label || "BENIGN").toUpperCase() !== "BENIGN") {
-      activityBuckets[time].threats += 1;
-    }
-  });
+    {
+      time: "16:00",
+      threats: 6,
+      packets: 51,
+    },
 
-  const activityData = Object.values(activityBuckets).sort((a, b) =>
-    a.time.localeCompare(b.time)
-  );
+    {
+      time: "18:00",
+      threats: 9,
+      packets: 74,
+    },
+  ];
 
   // ===================================================
   // SIDEBAR

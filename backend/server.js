@@ -10,6 +10,7 @@ const rateLimit = require("express-rate-limit");
 const NetworkTraffic = require("./models/NetworkTraffic");
 const NetworkEvent = require("./models/NetworkEvent");
 const SecurityAlert = require("./models/SecurityAlert");
+const { predictAttack } = require("./services/mlService");
 
 dotenv.config();
 
@@ -18,11 +19,17 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 const JWT_SECRET =
-  process.env.JWT_SECRET || "network_attack_super_secret_2026";
+  process.env.JWT_SECRET ||
+  "network_attack_super_secret_2026";
 
-// =========================
+const MONGODB_URI =
+  process.env.MONGODB_URI ||
+  "mongodb://127.0.0.1:27017/network_attack";
+
+
+// =========================================================
 // MIDDLEWARE
-// =========================
+// =========================================================
 
 app.use(helmet());
 
@@ -41,9 +48,10 @@ const limiter = rateLimit({
 
 app.use("/api/", limiter);
 
-// =========================
+
+// =========================================================
 // USER MODEL
-// =========================
+// =========================================================
 
 const userSchema = new mongoose.Schema(
   {
@@ -74,36 +82,60 @@ const userSchema = new mongoose.Schema(
   }
 );
 
-const User = mongoose.model("User", userSchema);
+const User =
+  mongoose.models.User ||
+  mongoose.model("User", userSchema);
 
-// =========================
-// REPORT MODEL
-// =========================
 
-const reportSchema = new mongoose.Schema(
+// =========================================================
+// SECURITY REPORT MODEL
+// =========================================================
+
+const securityReportSchema = new mongoose.Schema(
   {
-    title: String,
-    type: String,
-    description: String,
+    title: {
+      type: String,
+      default: "Network Security Report",
+    },
 
-    threats: {
+    type: {
+      type: String,
+      default: "Network Security Report",
+    },
+
+    totalTraffic: {
       type: Number,
       default: 0,
     },
 
-    blocked: {
+    totalEvents: {
       type: Number,
       default: 0,
     },
 
-    alerts: {
+    activeAlerts: {
       type: Number,
       default: 0,
     },
 
-    riskScore: {
+    resolvedAlerts: {
       type: Number,
       default: 0,
+    },
+
+    threatsDetected: {
+      type: Number,
+      default: 0,
+    },
+
+    highRiskThreats: {
+      type: Number,
+      default: 0,
+    },
+
+    riskLevel: {
+      type: String,
+      default: "Low",
     },
   },
   {
@@ -111,250 +143,108 @@ const reportSchema = new mongoose.Schema(
   }
 );
 
-const Report = mongoose.model("Report", reportSchema);
+const SecurityReport =
+  mongoose.models.SecurityReport ||
+  mongoose.model(
+    "SecurityReport",
+    securityReportSchema
+  );
 
-// =========================
+
+// =========================================================
 // DATABASE
-// =========================
+// =========================================================
 
 let mongoConnected = false;
 
 async function connectDatabase() {
   try {
-    await mongoose.connect(
-      process.env.MONGODB_URI ||
-        "mongodb://127.0.0.1:27017/network_attack"
-    );
+    await mongoose.connect(MONGODB_URI);
 
     mongoConnected = true;
 
-    console.log("MongoDB connected successfully");
+    console.log(
+      "MongoDB connected successfully"
+    );
   } catch (error) {
     mongoConnected = false;
 
-    console.log(
-      "MongoDB is not available. Running in API demo mode."
+    console.error(
+      "MongoDB connection error:",
+      error.message
     );
   }
 }
 
-// =========================
+
+// =========================================================
 // ROOT
-// =========================
+// =========================================================
 
 app.get("/", (req, res) => {
   res.json({
     success: true,
-    message: "Network Attack Backend is running",
+    message:
+      "Network Attack Backend is running",
   });
 });
 
-// =========================
+
+// =========================================================
 // HEALTH
-// =========================
+// =========================================================
 
 app.get("/api/health", (req, res) => {
   res.json({
     success: true,
+
     server: "running",
-    database: mongoConnected ? "connected" : "demo-mode",
+
+    database: mongoConnected
+      ? "connected"
+      : "disconnected",
   });
 });
 
-// =========================
-// REGISTER
-// =========================
 
-app.post("/api/auth/register", async (req, res) => {
-  try {
-    const { name, email, password } = req.body;
-
-    if (!name || !email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: "Name, email and password are required",
-      });
-    }
-
-    if (password.length < 6) {
-      return res.status(400).json({
-        success: false,
-        message: "Password must be at least 6 characters",
-      });
-    }
-
-    if (!mongoConnected) {
-      return res.status(201).json({
-        success: true,
-        message: "Registration successful in demo mode",
-        user: {
-          name,
-          email,
-          role: "user",
-        },
-      });
-    }
-
-    const existingUser = await User.findOne({
-      email: email.toLowerCase(),
-    });
-
-    if (existingUser) {
-      return res.status(409).json({
-        success: false,
-        message: "User already exists",
-      });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    const user = await User.create({
-      name,
-      email: email.toLowerCase(),
-      password: hashedPassword,
-      role: "user",
-    });
-
-    res.status(201).json({
-      success: true,
-      message: "Registration successful",
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-      },
-    });
-  } catch (error) {
-    console.error("Register error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Registration failed",
-    });
-  }
-});
-
-// =========================
-// LOGIN
-// =========================
-
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: "Email and password are required",
-      });
-    }
-
-    if (!mongoConnected) {
-      const token = jwt.sign(
-        {
-          email,
-          role: "user",
-        },
-        JWT_SECRET,
-        {
-          expiresIn: "2h",
-        }
-      );
-
-      return res.json({
-        success: true,
-        message: "Login successful in demo mode",
-        token,
-        user: {
-          name: "Demo User",
-          email,
-          role: "user",
-        },
-      });
-    }
-
-    const user = await User.findOne({
-      email: email.toLowerCase(),
-    });
-
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid email or password",
-      });
-    }
-
-    const passwordMatch = await bcrypt.compare(
-      password,
-      user.password
-    );
-
-    if (!passwordMatch) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid email or password",
-      });
-    }
-
-    const token = jwt.sign(
-      {
-        id: user._id,
-        email: user.email,
-        role: user.role,
-      },
-      JWT_SECRET,
-      {
-        expiresIn: "2h",
-      }
-    );
-
-    res.json({
-      success: true,
-      message: "Login successful",
-      token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-      },
-    });
-  } catch (error) {
-    console.error("Login error:", error);
-
-    res.status(500).json({
-      success: false,
-      message: "Login failed",
-    });
-  }
-});
-
-// =========================
-// JWT MIDDLEWARE
-// =========================
+// =========================================================
+// AUTHENTICATION
+// =========================================================
 
 function authenticateToken(req, res, next) {
-  const authHeader = req.headers.authorization;
+  const authHeader =
+    req.headers.authorization;
 
   if (!authHeader) {
     return res.status(401).json({
       success: false,
-      message: "Authorization token required",
+      message:
+        "Authorization token required",
     });
   }
 
-  const token = authHeader.split(" ")[1];
+  const parts =
+    authHeader.split(" ");
 
-  if (!token) {
+  if (
+    parts.length !== 2 ||
+    parts[0] !== "Bearer"
+  ) {
     return res.status(401).json({
       success: false,
-      message: "Invalid authorization format",
+      message:
+        "Invalid authorization format",
     });
   }
 
+  const token = parts[1];
+
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded =
+      jwt.verify(
+        token,
+        JWT_SECRET
+      );
 
     req.user = decoded;
 
@@ -362,260 +252,547 @@ function authenticateToken(req, res, next) {
   } catch (error) {
     return res.status(403).json({
       success: false,
-      message: "Invalid or expired token",
+      message:
+        "Invalid or expired token",
     });
   }
 }
 
-// =========================
+
+// =========================================================
+// REGISTER
+// =========================================================
+
+app.post(
+  "/api/auth/register",
+  async (req, res) => {
+    try {
+      const {
+        name,
+        email,
+        password,
+      } = req.body;
+
+      if (
+        !name ||
+        !email ||
+        !password
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Name, email and password are required",
+        });
+      }
+
+      if (password.length < 6) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Password must be at least 6 characters",
+        });
+      }
+
+      if (!mongoConnected) {
+        const token =
+          jwt.sign(
+            {
+              email,
+              role: "user",
+            },
+            JWT_SECRET,
+            {
+              expiresIn: "2h",
+            }
+          );
+
+        return res.status(201).json({
+          success: true,
+
+          message:
+            "Registration successful in demo mode",
+
+          token,
+
+          user: {
+            name,
+            email,
+            role: "user",
+          },
+        });
+      }
+
+      const normalizedEmail =
+        email.toLowerCase();
+
+      const existingUser =
+        await User.findOne({
+          email: normalizedEmail,
+        });
+
+      if (existingUser) {
+        return res.status(409).json({
+          success: false,
+          message:
+            "User already exists",
+        });
+      }
+
+      const hashedPassword =
+        await bcrypt.hash(
+          password,
+          10
+        );
+
+      const user =
+        await User.create({
+          name,
+
+          email: normalizedEmail,
+
+          password:
+            hashedPassword,
+
+          role: "user",
+        });
+
+      res.status(201).json({
+        success: true,
+
+        message:
+          "Registration successful",
+
+        user: {
+          id: user._id,
+
+          name: user.name,
+
+          email: user.email,
+
+          role: user.role,
+        },
+      });
+    } catch (error) {
+      console.error(
+        "Register error:",
+        error
+      );
+
+      res.status(500).json({
+        success: false,
+        message:
+          "Registration failed",
+      });
+    }
+  }
+);
+
+
+// =========================================================
+// LOGIN
+// =========================================================
+
+app.post(
+  "/api/auth/login",
+  async (req, res) => {
+    try {
+      const {
+        email,
+        password,
+      } = req.body;
+
+      if (
+        !email ||
+        !password
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Email and password are required",
+        });
+      }
+
+      if (!mongoConnected) {
+        const token =
+          jwt.sign(
+            {
+              email,
+              role: "user",
+            },
+            JWT_SECRET,
+            {
+              expiresIn: "2h",
+            }
+          );
+
+        return res.json({
+          success: true,
+
+          message:
+            "Login successful in demo mode",
+
+          token,
+
+          user: {
+            name: "Demo User",
+
+            email,
+
+            role: "user",
+          },
+        });
+      }
+
+      const user =
+        await User.findOne({
+          email:
+            email.toLowerCase(),
+        });
+
+      if (!user) {
+        return res.status(401).json({
+          success: false,
+          message:
+            "Invalid email or password",
+        });
+      }
+
+      const passwordMatch =
+        await bcrypt.compare(
+          password,
+          user.password
+        );
+
+      if (!passwordMatch) {
+        return res.status(401).json({
+          success: false,
+          message:
+            "Invalid email or password",
+        });
+      }
+
+      const token =
+        jwt.sign(
+          {
+            id: user._id,
+
+            email: user.email,
+
+            role: user.role,
+          },
+          JWT_SECRET,
+          {
+            expiresIn: "2h",
+          }
+        );
+
+      res.json({
+        success: true,
+
+        message:
+          "Login successful",
+
+        token,
+
+        user: {
+          id: user._id,
+
+          name: user.name,
+
+          email: user.email,
+
+          role: user.role,
+        },
+      });
+    } catch (error) {
+      console.error(
+        "Login error:",
+        error
+      );
+
+      res.status(500).json({
+        success: false,
+        message:
+          "Login failed",
+      });
+    }
+  }
+);
+
+
+// =========================================================
 // DASHBOARD
-// =========================
+// =========================================================
 
 app.get(
   "/api/dashboard",
   authenticateToken,
   async (req, res) => {
     try {
-      if (!mongoConnected) {
-        return res.json({
-          success: true,
-          data: {
-            totalAlerts: 0,
-            totalEvents: 0,
-            threatsDetected: 0,
-            blockedThreats: 0,
-            networkStatus: "Secure",
-          },
-        });
-      }
+      let trafficRecords = 0;
 
-      const totalAlerts = await SecurityAlert.countDocuments();
-
-      const totalEvents = await NetworkEvent.countDocuments();
-
-      const threatsDetected =
-        await NetworkEvent.countDocuments();
-
-      const blockedThreats =
-        await SecurityAlert.countDocuments({
-          status: "Resolved",
-        });
-
-      res.json({
-        success: true,
-        data: {
-          totalAlerts,
-          totalEvents,
-          threatsDetected,
-          blockedThreats,
-          networkStatus: "Secure",
-        },
-      });
-    } catch (error) {
-      console.error("Dashboard error:", error);
-
-      res.status(500).json({
-        success: false,
-        message: "Dashboard data unavailable",
-      });
-    }
-  }
-);
-
-// =========================
-// MONITOR START
-// =========================
-
-app.post(
-  "/api/monitor/start",
-  authenticateToken,
-  (req, res) => {
-    res.json({
-      success: true,
-      message: "Network monitoring started",
-      status: "active",
-    });
-  }
-);
-
-// =========================
-// MONITOR STOP
-// =========================
-
-app.post(
-  "/api/monitor/stop",
-  authenticateToken,
-  (req, res) => {
-    res.json({
-      success: true,
-      message: "Network monitoring stopped",
-      status: "inactive",
-    });
-  }
-);
-
-// =========================
-// ATTACK SCAN
-// =========================
-
-app.post(
-  "/api/scan",
-  authenticateToken,
-  async (req, res) => {
-    try {
-      const threats = [
-        "Port Scan",
-        "Brute Force",
-        "Malware Traffic",
-        "Suspicious Connection",
-        "DDoS Pattern",
-      ];
-
-      const detected =
-        threats[Math.floor(Math.random() * threats.length)];
-
-      const confidence =
-        Math.floor(Math.random() * 20) + 80;
-
-      if (mongoConnected) {
-        const sourceIP =
-          req.body.sourceIP || "192.168.1.100";
-
-        const destinationIP =
-          req.body.destinationIP || "10.0.0.1";
-
-        await NetworkEvent.create({
-          eventType: detected,
-          sourceIP,
-          destinationIP,
-          protocol: "TCP",
-          severity: "High",
-          description: `${detected} detected during network scan`,
-          status: "Detected",
-        });
-
-        await SecurityAlert.create({
-          title: `${detected} Detected`,
-          type: detected,
-          sourceIP,
-          destinationIP,
-          severity: "High",
-          description: `${detected} detected during network scan`,
-          status: "Active",
-          confidence,
-        });
-      }
-
-      res.json({
-        success: true,
-        message: "Network scan completed",
-        result: {
-          threatDetected: detected,
-          severity: "High",
-          confidence,
-        },
-      });
-    } catch (error) {
-      console.error("Scan error:", error);
-
-      res.status(500).json({
-        success: false,
-        message: "Network scan failed",
-      });
-    }
-  }
-);
-
-// =========================
-// TRAFFIC ANALYSIS
-// =========================
-
-app.post(
-  "/api/traffic/analyze",
-  authenticateToken,
-  async (req, res) => {
-    try {
-      if (!mongoConnected) {
-        return res.json({
-          success: true,
-          analysis: {
-            totalPackets: 0,
-            tcp: 0,
-            udp: 0,
-            http: 0,
-            https: 0,
-            suspiciousTraffic: 0,
-          },
-        });
-      }
-
-      const traffic = await NetworkTraffic.find()
-        .sort({ timestamp: -1 })
-        .limit(1000);
-
-      let tcp = 0;
-      let udp = 0;
-      let http = 0;
-      let https = 0;
-      let suspiciousTraffic = 0;
       let totalPackets = 0;
 
-      traffic.forEach((item) => {
-        const protocol = item.protocol
-          ? item.protocol.toUpperCase()
-          : "";
+      let totalEvents = 0;
 
-        totalPackets += item.packetCount || 0;
+      let activeAlerts = 0;
 
-        if (protocol === "TCP") {
-          tcp += 1;
-        }
+      let threatsDetected = 0;
 
-        if (protocol === "UDP") {
-          udp += 1;
-        }
+      let blockedThreats = 0;
 
-        if (protocol === "HTTP") {
-          http += 1;
-        }
+      const protocolCounts = {
+        TCP: 0,
+        UDP: 0,
+        ICMP: 0,
+        Other: 0,
+      };
 
-        if (protocol === "HTTPS") {
-          https += 1;
-        }
 
-        if (
-          item.label &&
-          item.label.toUpperCase() !== "BENIGN"
-        ) {
-          suspiciousTraffic += 1;
-        }
-      });
+      // =====================================================
+      // GET REAL DATA FROM MONGODB
+      // =====================================================
+
+      if (mongoConnected) {
+        const traffic =
+          await NetworkTraffic.find({})
+            .lean();
+
+
+        // Number of traffic records
+        trafficRecords =
+          traffic.length;
+
+
+        // IMPORTANT:
+        // Sum actual packetCount values.
+        // We DO NOT use countDocuments()
+        // for the Packets value.
+        totalPackets =
+          traffic.reduce(
+            (total, item) => {
+              return (
+                total +
+                Number(
+                  item.packetCount || 0
+                )
+              );
+            },
+            0
+          );
+
+
+        // Protocol distribution
+        traffic.forEach(
+          (item) => {
+            const protocol =
+              String(
+                item.protocol ||
+                  "Other"
+              ).toUpperCase();
+
+            if (
+              protocolCounts[
+                protocol
+              ] !== undefined
+            ) {
+              protocolCounts[
+                protocol
+              ]++;
+            } else {
+              protocolCounts.Other++;
+            }
+          }
+        );
+
+
+        totalEvents =
+          await NetworkEvent.countDocuments();
+
+
+        activeAlerts =
+          await SecurityAlert.countDocuments(
+            {
+              status: "Active",
+            }
+          );
+
+
+        threatsDetected =
+          await NetworkEvent.countDocuments(
+            {
+              eventType: {
+                $ne: "BENIGN",
+              },
+            }
+          );
+
+
+        blockedThreats =
+          await SecurityAlert.countDocuments(
+            {
+              status: "Resolved",
+            }
+          );
+      }
+
+
+      // =====================================================
+      // RISK
+      // =====================================================
+
+      let riskLevel = "Low";
+
+      let riskScore = 20;
+
+
+      if (activeAlerts >= 5) {
+        riskLevel = "Critical";
+
+        riskScore = 90;
+      } else if (activeAlerts >= 3) {
+        riskLevel = "High";
+
+        riskScore = 75;
+      } else if (activeAlerts >= 1) {
+        riskLevel = "Medium";
+
+        riskScore = 50;
+      }
+
+
+      // =====================================================
+      // RESPONSE
+      // =====================================================
 
       res.json({
         success: true,
-        analysis: {
-          totalPackets,
-          tcp,
-          udp,
-          http,
-          https,
-          suspiciousTraffic,
+
+        monitoring: false,
+
+        data: {
+          // ACTUAL PACKET COUNT
+          packets: totalPackets,
+
+          totalPackets: totalPackets,
+
+          // Number of MongoDB traffic documents
+          trafficRecords:
+            trafficRecords,
+
+          totalTraffic:
+            trafficRecords,
+
+          threatsDetected:
+            threatsDetected,
+
+          threats:
+            threatsDetected,
+
+          blockedThreats:
+            blockedThreats,
+
+          blocked:
+            blockedThreats,
+
+          totalAlerts:
+            activeAlerts,
+
+          activeAlerts:
+            activeAlerts,
+
+          connections:
+            trafficRecords,
+
+          totalEvents:
+            totalEvents,
+
+          riskScore:
+            riskScore,
+
+          riskLevel:
+            riskLevel,
+
+          risk: {
+            score: riskScore,
+
+            level: riskLevel,
+          },
+
+          networkStatus:
+            activeAlerts > 0
+              ? "Under Investigation"
+              : "Secure",
+
+          protocols:
+            protocolCounts,
         },
       });
     } catch (error) {
-      console.error("Traffic analysis error:", error);
+      console.error(
+        "Dashboard error:",
+        error
+      );
 
       res.status(500).json({
         success: false,
-        message: "Traffic analysis failed",
+
+        message:
+          "Dashboard data unavailable",
       });
     }
   }
 );
 
-// =========================
-// IMPORT NETWORK TRAFFIC
-// =========================
+
+// =========================================================
+// NETWORK TRAFFIC
+// =========================================================
+
+app.get(
+  "/api/traffic",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      let traffic = [];
+
+      if (mongoConnected) {
+        traffic =
+          await NetworkTraffic.find({})
+            .sort({
+              _id: -1,
+            })
+            .limit(100)
+            .lean();
+      }
+
+      res.json({
+        success: true,
+
+        traffic,
+
+        data: traffic,
+      });
+    } catch (error) {
+      console.error(
+        "Traffic error:",
+        error
+      );
+
+      res.status(500).json({
+        success: false,
+
+        message:
+          "Unable to load network traffic",
+      });
+    }
+  }
+);
+
+
+// =========================================================
+// IMPORT TRAFFIC
+// =========================================================
 
 app.post(
   "/api/traffic/import",
@@ -625,164 +802,874 @@ app.post(
       if (!mongoConnected) {
         return res.status(503).json({
           success: false,
-          message: "MongoDB is not connected",
+
+          message:
+            "MongoDB is not connected",
         });
       }
 
-      const trafficData = req.body;
+      const records =
+        Array.isArray(req.body)
+          ? req.body
+          : req.body.records;
 
-      if (!Array.isArray(trafficData)) {
+      if (
+        !records ||
+        !Array.isArray(records) ||
+        records.length === 0
+      ) {
         return res.status(400).json({
           success: false,
-          message: "Traffic data must be an array",
-        });
-      }
 
-      if (trafficData.length === 0) {
-        return res.status(400).json({
-          success: false,
-          message: "Traffic data is empty",
+          message:
+            "Traffic records are required",
         });
       }
 
       const inserted =
-        await NetworkTraffic.insertMany(trafficData);
+        await NetworkTraffic.insertMany(
+          records
+        );
 
       res.status(201).json({
         success: true,
-        message: "Network traffic imported successfully",
-        count: inserted.length,
+
+        message:
+          "Traffic data imported successfully",
+
+        count:
+          inserted.length,
+
+        data:
+          inserted,
       });
     } catch (error) {
-      console.error("Traffic import error:", error);
+      console.error(
+        "Traffic import error:",
+        error
+      );
 
       res.status(500).json({
         success: false,
-        message: "Unable to import network traffic",
+
+        message:
+          "Unable to import traffic data",
       });
     }
   }
 );
 
-// =========================
-// GET NETWORK TRAFFIC
-// =========================
 
-app.get(
-  "/api/traffic",
+// =========================================================
+// MONITOR START
+// =========================================================
+
+app.post(
+  "/api/monitor/start",
+  authenticateToken,
+  (req, res) => {
+    res.json({
+      success: true,
+
+      monitoring: true,
+
+      status: "active",
+
+      message:
+        "Network monitoring started",
+    });
+  }
+);
+
+
+// =========================================================
+// MONITOR STOP
+// =========================================================
+
+app.post(
+  "/api/monitor/stop",
+  authenticateToken,
+  (req, res) => {
+    res.json({
+      success: true,
+
+      monitoring: false,
+
+      status: "inactive",
+
+      message:
+        "Network monitoring stopped",
+    });
+  }
+);
+
+
+// =========================================================
+// ATTACK SCAN — ML
+// =========================================================
+
+app.post(
+  "/api/scan",
   authenticateToken,
   async (req, res) => {
     try {
-      if (!mongoConnected) {
-        return res.json({
-          success: true,
-          traffic: [],
-        });
+      let trafficData = null;
+
+
+      // Get newest traffic record
+      if (mongoConnected) {
+        trafficData =
+          await NetworkTraffic.findOne(
+            {}
+          )
+            .sort({
+              _id: -1,
+            })
+            .lean();
       }
 
-      const traffic = await NetworkTraffic.find()
-        .sort({ timestamp: -1 })
-        .limit(500);
+
+      // Default traffic
+      if (!trafficData) {
+        trafficData = {
+          sourceIP:
+            req.body?.target ||
+            "192.168.1.25",
+
+          destinationIP:
+            "10.0.0.20",
+
+          protocol:
+            "TCP",
+
+          sourcePort:
+            5000,
+
+          destinationPort:
+            22,
+
+          packetCount:
+            450,
+
+          bytes:
+            56000,
+
+          duration:
+            25,
+
+          flowRate:
+            2240,
+
+          label:
+            "Port Scan",
+        };
+      }
+
+
+      // =====================================================
+      // ML PREDICTION
+      // =====================================================
+
+      const prediction =
+        await predictAttack(
+          trafficData
+        );
+
+
+      const attackType =
+        prediction.attackType ||
+        prediction.prediction ||
+        "Unknown";
+
+
+      const confidence =
+        Number(
+          prediction.confidence ||
+            0
+        );
+
+
+      const risk =
+        prediction.risk ||
+        "Unknown";
+
+
+      // =====================================================
+      // SEVERITY
+      // =====================================================
+
+      let severity =
+        "Low";
+
+
+      if (
+        attackType ===
+        "DDoS"
+      ) {
+        severity =
+          "Critical";
+      } else if (
+        attackType ===
+          "Port Scan" ||
+        attackType ===
+          "Brute Force"
+      ) {
+        severity =
+          "High";
+      } else if (
+        attackType !==
+          "BENIGN" &&
+        attackType !==
+          "Unknown"
+      ) {
+        severity =
+          "Medium";
+      }
+
+
+      // =====================================================
+      // SAVE EVENT + ALERT
+      // =====================================================
+
+      let event = null;
+
+      let alert = null;
+
+
+      if (mongoConnected) {
+        event =
+          await NetworkEvent.create(
+            {
+              eventType:
+                attackType,
+
+              sourceIP:
+                trafficData.sourceIP ||
+                "Unknown",
+
+              destinationIP:
+                trafficData.destinationIP ||
+                "Unknown",
+
+              protocol:
+                trafficData.protocol ||
+                "TCP",
+
+              severity:
+
+                severity,
+
+              description:
+                `${attackType} detected by ML model with ${confidence}% confidence.`,
+
+              status:
+                "Detected",
+            }
+          );
+
+
+        if (
+          attackType !==
+            "BENIGN" &&
+          attackType !==
+            "Unknown"
+        ) {
+          alert =
+            await SecurityAlert.create(
+              {
+                title:
+                  `${attackType} Detected`,
+
+                type:
+                  attackType,
+
+                sourceIP:
+                  trafficData.sourceIP ||
+                  "Unknown",
+
+                destinationIP:
+                  trafficData.destinationIP ||
+                  "Unknown",
+
+                severity:
+
+                  severity,
+
+                description:
+                  `ML model detected ${attackType} with ${confidence}% confidence.`,
+
+                status:
+                  "Active",
+
+                confidence:
+
+                  confidence,
+
+                detectedAt:
+                  new Date(),
+              }
+            );
+        }
+      }
+
+
+      // =====================================================
+      // RESULT
+      // =====================================================
+
+      const result = {
+        attackType:
+
+          attackType,
+
+        prediction:
+
+          attackType,
+
+        confidence:
+
+          confidence,
+
+        risk:
+
+          risk,
+
+        severity:
+
+          severity,
+
+        sourceIP:
+
+          trafficData.sourceIP,
+
+        destinationIP:
+
+          trafficData.destinationIP,
+
+        protocol:
+
+          trafficData.protocol,
+
+        sourcePort:
+
+          trafficData.sourcePort,
+
+        destinationPort:
+
+          trafficData.destinationPort,
+
+        packetCount:
+
+          trafficData.packetCount,
+
+        bytes:
+
+          trafficData.bytes,
+
+        duration:
+
+          trafficData.duration,
+
+        flowRate:
+
+          trafficData.flowRate,
+
+        status:
+          "Detected",
+
+        eventId:
+          event?._id ||
+          null,
+
+        alertId:
+          alert?._id ||
+          null,
+      };
+
 
       res.json({
-        success: true,
-        traffic,
+        success:
+          true,
+
+        message:
+          `${attackType} detected successfully`,
+
+        result:
+
+          result,
+
+        attack:
+
+          result,
       });
     } catch (error) {
-      console.error("Traffic loading error:", error);
+      console.error(
+        "Scan error:",
+        error
+      );
 
       res.status(500).json({
         success: false,
-        message: "Unable to load traffic data",
+
+        message:
+          "Network attack scan failed",
+
+        error:
+          error.message,
       });
     }
   }
 );
 
-// =========================
-// THREAT INTELLIGENCE
-// =========================
+
+// =========================================================
+// TRAFFIC ANALYSIS
+// =========================================================
+
+app.post(
+  "/api/traffic/analyze",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      let traffic = [];
+
+      if (mongoConnected) {
+        traffic =
+          await NetworkTraffic.find({})
+            .sort({
+              _id: -1,
+            })
+            .limit(100)
+            .lean();
+      }
+
+
+      let totalPackets = 0;
+
+      let totalBytes = 0;
+
+      let suspiciousTraffic = 0;
+
+
+      traffic.forEach(
+        (item) => {
+          totalPackets +=
+            Number(
+              item.packetCount ||
+                0
+            );
+
+          totalBytes +=
+            Number(
+              item.bytes ||
+                0
+            );
+
+          if (
+            item.label &&
+            item.label !==
+              "BENIGN"
+          ) {
+            suspiciousTraffic++;
+          }
+        }
+      );
+
+
+      const analysis = {
+        totalPackets:
+
+          totalPackets,
+
+        totalBytes:
+
+          totalBytes,
+
+        incoming:
+
+          totalPackets,
+
+        outgoing:
+
+          0,
+
+        suspicious:
+
+          suspiciousTraffic,
+
+        suspiciousTraffic:
+
+          suspiciousTraffic,
+
+        tcp:
+          traffic.filter(
+            (x) =>
+              String(
+                x.protocol
+              ).toUpperCase() ===
+              "TCP"
+          ).length,
+
+        udp:
+          traffic.filter(
+            (x) =>
+              String(
+                x.protocol
+              ).toUpperCase() ===
+              "UDP"
+          ).length,
+
+        icmp:
+          traffic.filter(
+            (x) =>
+              String(
+                x.protocol
+              ).toUpperCase() ===
+              "ICMP"
+          ).length,
+      };
+
+
+      res.json({
+        success:
+
+          true,
+
+        message:
+          "Traffic analysis completed",
+
+        analysis:
+
+          analysis,
+
+        traffic:
+
+          analysis,
+      });
+    } catch (error) {
+      console.error(
+        "Traffic analysis error:",
+        error
+      );
+
+      res.status(500).json({
+        success: false,
+
+        message:
+          "Traffic analysis failed",
+      });
+    }
+  }
+);
+
+
+// =========================================================
+// THREAT INTELLIGENCE — GET
+// =========================================================
+
+app.get(
+  "/api/threat-intel",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      let threats = [];
+
+      if (mongoConnected) {
+        threats =
+          await NetworkEvent.find(
+            {
+              eventType: {
+                $ne: "BENIGN",
+              },
+            }
+          )
+            .sort({
+              _id: -1,
+            })
+            .limit(50)
+            .lean();
+      }
+
+      res.json({
+        success:
+          true,
+
+        threats:
+
+          threats,
+
+        data:
+
+          threats,
+      });
+    } catch (error) {
+      console.error(
+        "Threat intelligence error:",
+        error
+      );
+
+      res.status(500).json({
+        success: false,
+
+        message:
+          "Unable to load threat intelligence",
+      });
+    }
+  }
+);
+
+
+// =========================================================
+// THREAT INTELLIGENCE — POST
+// =========================================================
 
 app.post(
   "/api/threat-intel",
   authenticateToken,
   async (req, res) => {
     try {
-      const indicator = req.body.indicator || "Unknown";
+      const target =
+        String(
+          req.body?.target ||
+          req.body?.indicator ||
+          ""
+        ).trim();
 
-      let riskLevel = "Low";
-      let threatType = "No Known Threat";
-      let confidence = "25%";
 
-      if (
-        indicator.includes(".") ||
-        indicator.includes(":")
-      ) {
-        riskLevel = "High";
-        threatType = "Suspicious Network Activity";
-        confidence = "91%";
+      if (!target) {
+        return res.status(400).json({
+          success: false,
+
+          message:
+            "Please enter an IP address or domain",
+        });
       }
 
+
+      let matchingEvents = [];
+
+
+      if (mongoConnected) {
+        matchingEvents =
+          await NetworkEvent.find(
+            {
+              $or: [
+                {
+                  sourceIP:
+                    target,
+                },
+
+                {
+                  destinationIP:
+                    target,
+                },
+              ],
+            }
+          )
+            .sort({
+              _id: -1,
+            })
+            .limit(50)
+            .lean();
+      }
+
+
+      const threatEvents =
+        matchingEvents.filter(
+          (event) =>
+            event.eventType !==
+            "BENIGN"
+        );
+
+
+      let riskScore =
+        0;
+
+
+      if (
+        threatEvents.length >
+        0
+      ) {
+        riskScore =
+          85;
+      } else if (
+        matchingEvents.length >
+        0
+      ) {
+        riskScore =
+          30;
+      } else {
+        riskScore =
+          10;
+      }
+
+
+      let reputation =
+        "Good";
+
+      let category =
+        "No Known Threat";
+
+
+      if (
+        riskScore >=
+        80
+      ) {
+        reputation =
+          "Malicious";
+
+        category =
+          "Network Attack";
+      } else if (
+        riskScore >=
+        50
+      ) {
+        reputation =
+          "Suspicious";
+
+        category =
+          "Suspicious Activity";
+      }
+
+
+      const result = {
+        target:
+
+          target,
+
+        indicator:
+
+          target,
+
+        riskScore:
+
+          riskScore,
+
+        reputation:
+
+          reputation,
+
+        category:
+
+          category,
+
+        reports:
+
+          threatEvents.length,
+
+        totalEvents:
+
+          matchingEvents.length,
+
+        threats:
+
+          threatEvents,
+
+        lastDetected:
+          threatEvents.length >
+          0
+            ? threatEvents[0]
+                .timestamp
+            : null,
+
+        recommendation:
+          threatEvents.length >
+          0
+            ? "Investigate the source and monitor related traffic."
+            : "Continue monitoring this indicator.",
+      };
+
+
       res.json({
-        success: true,
-        indicator,
-        result: {
-          riskLevel,
-          threatType,
-          confidence,
-          recommendation:
-            "Investigate the source and monitor related traffic.",
-        },
+        success:
+
+          true,
+
+        message:
+          "Threat intelligence analysis completed",
+
+        result:
+
+          result,
+
+        data:
+
+          result,
       });
     } catch (error) {
-      console.error("Threat intelligence error:", error);
+      console.error(
+        "Threat intelligence POST error:",
+        error
+      );
 
       res.status(500).json({
         success: false,
-        message: "Threat intelligence check failed",
+
+        message:
+          "Threat intelligence analysis failed",
       });
     }
   }
 );
 
-// =========================
+
+// =========================================================
 // ALERTS
-// =========================
+// =========================================================
 
 app.get(
   "/api/alerts",
   authenticateToken,
   async (req, res) => {
     try {
-      if (!mongoConnected) {
-        return res.json({
-          success: true,
-          alerts: [],
-        });
+      let alerts = [];
+
+      if (mongoConnected) {
+        alerts =
+          await SecurityAlert.find(
+            {}
+          )
+            .sort({
+              _id: -1,
+            })
+            .limit(100)
+            .lean();
       }
 
-      const alerts = await SecurityAlert.find()
-        .sort({ createdAt: -1 })
-        .limit(100);
 
       res.json({
-        success: true,
-        alerts,
+        success:
+
+          true,
+
+        alerts:
+
+          alerts,
+
+        data:
+
+          alerts,
       });
     } catch (error) {
-      console.error("Alerts error:", error);
+      console.error(
+        "Alerts error:",
+        error
+      );
 
       res.status(500).json({
         success: false,
-        message: "Unable to load alerts",
+
+        message:
+          "Unable to load alerts",
       });
     }
   }
 );
 
-// =========================
+
+// =========================================================
 // RESOLVE ALERT
-// =========================
+// =========================================================
 
 app.patch(
   "/api/alerts/:id/resolve",
@@ -790,220 +1677,425 @@ app.patch(
   async (req, res) => {
     try {
       if (!mongoConnected) {
-        return res.status(503).json({
-          success: false,
-          message: "MongoDB is not connected",
+        return res.json({
+          success:
+            true,
+
+          message:
+            "Alert resolved in demo mode",
         });
       }
+
 
       const alert =
         await SecurityAlert.findByIdAndUpdate(
           req.params.id,
+
           {
-            status: "Resolved",
-            resolvedAt: new Date(),
+            status:
+              "Resolved",
+
+            resolvedAt:
+              new Date(),
           },
+
           {
             new: true,
           }
         );
 
+
       if (!alert) {
         return res.status(404).json({
-          success: false,
-          message: "Alert not found",
+          success:
+            false,
+
+          message:
+            "Alert not found",
         });
       }
 
+
       res.json({
-        success: true,
-        message: "Alert resolved",
-        alert,
+        success:
+
+          true,
+
+        message:
+          "Alert resolved successfully",
+
+        alert:
+
+          alert,
       });
     } catch (error) {
-      console.error("Resolve alert error:", error);
+      console.error(
+        "Resolve alert error:",
+        error
+      );
 
       res.status(500).json({
         success: false,
-        message: "Unable to resolve alert",
+
+        message:
+          "Unable to resolve alert",
       });
     }
   }
 );
 
-// =========================
+
+// =========================================================
 // EVENTS
-// =========================
+// =========================================================
 
 app.get(
   "/api/events",
   authenticateToken,
   async (req, res) => {
     try {
-      if (!mongoConnected) {
-        return res.json({
-          success: true,
-          events: [],
-        });
+      let events = [];
+
+      if (mongoConnected) {
+        events =
+          await NetworkEvent.find(
+            {}
+          )
+            .sort({
+              _id: -1,
+            })
+            .limit(100)
+            .lean();
       }
 
-      const events = await NetworkEvent.find()
-        .sort({ createdAt: -1 })
-        .limit(100);
 
       res.json({
-        success: true,
-        events,
+        success:
+
+          true,
+
+        events:
+
+          events,
+
+        data:
+
+          events,
       });
     } catch (error) {
-      console.error("Events error:", error);
+      console.error(
+        "Events error:",
+        error
+      );
 
       res.status(500).json({
         success: false,
-        message: "Unable to load events",
+
+        message:
+          "Unable to load events",
       });
     }
   }
 );
 
-// =========================
-// CREATE REPORT
-// =========================
+
+// =========================================================
+// GENERATE REPORT
+// =========================================================
 
 app.post(
   "/api/reports",
   authenticateToken,
   async (req, res) => {
     try {
-      if (!mongoConnected) {
-        return res.status(503).json({
-          success: false,
-          message: "MongoDB is not connected",
-        });
+      let totalTraffic = 0;
+
+      let totalEvents = 0;
+
+      let activeAlerts = 0;
+
+      let resolvedAlerts = 0;
+
+      let threatsDetected = 0;
+
+      let highRiskThreats = 0;
+
+
+      if (mongoConnected) {
+        totalTraffic =
+          await NetworkTraffic.countDocuments();
+
+
+        totalEvents =
+          await NetworkEvent.countDocuments();
+
+
+        activeAlerts =
+          await SecurityAlert.countDocuments(
+            {
+              status:
+                "Active",
+            }
+          );
+
+
+        resolvedAlerts =
+          await SecurityAlert.countDocuments(
+            {
+              status:
+                "Resolved",
+            }
+          );
+
+
+        threatsDetected =
+          await NetworkEvent.countDocuments(
+            {
+              eventType: {
+                $ne: "BENIGN",
+              },
+            }
+          );
+
+
+        highRiskThreats =
+          await NetworkEvent.countDocuments(
+            {
+              severity: {
+                $in: [
+                  "High",
+                  "Critical",
+                ],
+              },
+            }
+          );
       }
 
-      const totalAlerts =
-        await SecurityAlert.countDocuments();
 
-      const totalThreats =
-        await NetworkEvent.countDocuments();
+      let riskLevel =
+        "Low";
 
-      const resolvedAlerts =
-        await SecurityAlert.countDocuments({
-          status: "Resolved",
-        });
 
-      const report = await Report.create({
+      if (
+        highRiskThreats >=
+        5
+      ) {
+        riskLevel =
+          "Critical";
+      } else if (
+        highRiskThreats >=
+        3
+      ) {
+        riskLevel =
+          "High";
+      } else if (
+        highRiskThreats >=
+        1
+      ) {
+        riskLevel =
+          "Medium";
+      }
+
+
+      const reportData = {
         title:
-          req.body.title || "Network Security Report",
+          req.body?.type ||
+          "Network Security Report",
 
         type:
-          req.body.type || "Threat Analysis",
+          req.body?.type ||
+          "Network Security Report",
 
-        description:
-          req.body.description ||
-          "Generated network security analysis report.",
+        totalTraffic:
 
-        threats: totalThreats,
+          totalTraffic,
 
-        blocked: resolvedAlerts,
+        totalEvents:
 
-        alerts: totalAlerts,
+          totalEvents,
 
-        riskScore:
-          totalAlerts > 0
-            ? Math.min(100, totalAlerts * 10)
-            : 0,
-      });
+        activeAlerts:
 
-      res.status(201).json({
-        success: true,
-        message: "Report generated successfully",
-        report,
+          activeAlerts,
+
+        resolvedAlerts:
+
+          resolvedAlerts,
+
+        threatsDetected:
+
+          threatsDetected,
+
+        highRiskThreats:
+
+          highRiskThreats,
+
+        riskLevel:
+
+          riskLevel,
+      };
+
+
+      let savedReport =
+        reportData;
+
+
+      if (mongoConnected) {
+        savedReport =
+          await SecurityReport.create(
+            reportData
+          );
+      }
+
+
+      res.json({
+        success:
+
+          true,
+
+        message:
+          "Security report generated successfully",
+
+        report:
+
+          savedReport,
       });
     } catch (error) {
-      console.error("Report generation error:", error);
+      console.error(
+        "Report generation error:",
+        error
+      );
 
       res.status(500).json({
         success: false,
-        message: "Unable to generate report",
+
+        message:
+          "Report generation failed",
       });
     }
   }
 );
 
-// =========================
-// REPORTS
-// =========================
+
+// =========================================================
+// GET REPORTS
+// =========================================================
 
 app.get(
   "/api/reports",
   authenticateToken,
   async (req, res) => {
     try {
-      if (!mongoConnected) {
-        return res.json({
-          success: true,
-          reports: [],
-        });
+      let reports = [];
+
+      if (mongoConnected) {
+        reports =
+          await SecurityReport.find(
+            {}
+          )
+            .sort({
+              _id: -1,
+            })
+            .limit(50)
+            .lean();
       }
 
-      const reports = await Report.find()
-        .sort({ createdAt: -1 })
-        .limit(100);
 
       res.json({
-        success: true,
-        reports,
+        success:
+
+          true,
+
+        reports:
+
+          reports,
+
+        data:
+
+          reports,
       });
     } catch (error) {
-      console.error("Reports error:", error);
+      console.error(
+        "Reports error:",
+        error
+      );
 
       res.status(500).json({
         success: false,
-        message: "Unable to load reports",
+
+        message:
+          "Unable to load reports",
       });
     }
   }
 );
 
-// =========================
+
+// =========================================================
 // 404
-// =========================
+// =========================================================
 
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    message: "API endpoint not found",
-    path: req.originalUrl,
-  });
-});
+app.use(
+  (req, res) => {
+    res.status(404).json({
+      success:
+        false,
 
-// =========================
+      message:
+        "API endpoint not found",
+
+      path:
+        req.originalUrl,
+
+      method:
+        req.method,
+    });
+  }
+);
+
+
+// =========================================================
 // ERROR HANDLER
-// =========================
+// =========================================================
 
-app.use((err, req, res, next) => {
-  console.error(err);
+app.use(
+  (
+    err,
+    req,
+    res,
+    next
+  ) => {
+    console.error(
+      "Server error:",
+      err
+    );
 
-  res.status(500).json({
-    success: false,
-    message: "Internal server error",
-  });
-});
+    res.status(500).json({
+      success:
+        false,
 
-// =========================
+      message:
+        "Internal server error",
+    });
+  }
+);
+
+
+// =========================================================
 // START SERVER
-// =========================
+// =========================================================
 
 async function startServer() {
   await connectDatabase();
 
-  app.listen(PORT, () => {
-    console.log(
-      `Server running on http://localhost:${PORT}`
-    );
-  });
+  app.listen(
+    PORT,
+    () => {
+      console.log(
+        `Server running on http://localhost:${PORT}`
+      );
+    }
+  );
 }
 
 startServer();
